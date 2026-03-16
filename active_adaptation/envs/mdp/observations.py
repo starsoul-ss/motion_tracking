@@ -9,10 +9,11 @@ import active_adaptation
 from active_adaptation.utils.math import quat_apply, quat_apply_inverse, yaw_quat, quat_mul, quat_conjugate
 import active_adaptation.utils.symmetry as sym_utils
 import active_adaptation.utils.joint_order as joint_order_utils
+from active_adaptation.envs.mdp.commands.utils import add_spherical_noise, perturb_quaternion
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity as Articulation
-    from mjlab.sensor import ContactSensor
+    from mjlab.sensor import ContactSensor, BuiltinSensor
     from active_adaptation.envs.base import _Env
 
 from mjlab.utils.lab_api.string import resolve_matching_names
@@ -99,6 +100,7 @@ def observation_wrapper(func: Callable[[], torch.Tensor], func_sym: Callable):
             super().__init__(env)
             self.params = params
             self._func_kwargs, func_accepts_all = _select_kwargs(func, params)
+            self._func_sym_kwargs, _ = _select_kwargs(func_sym, params)
             if not func_accepts_all:
                 unknown = set(params.keys()) - set(self._func_kwargs.keys())
                 if len(unknown) > 0:
@@ -110,7 +112,7 @@ def observation_wrapper(func: Callable[[], torch.Tensor], func_sym: Callable):
             return func(**self._func_kwargs)
 
         def symmetry_transforms(self):
-            return func_sym()
+            return func_sym(**self._func_sym_kwargs)
 
     return ObservationWrapper
 
@@ -118,6 +120,7 @@ class root_angvel_b_history(Observation):
     def __init__(self, env, noise_std: float=0., history_steps: list[int]=[1]):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
+        self.imu_ang_vel_sensor: BuiltinSensor = self.env.scene["robot/imu_ang_vel"]
         self.noise_std = noise_std
         self.history_steps = history_steps
         buffer_size = max(history_steps) + 1
@@ -125,16 +128,12 @@ class root_angvel_b_history(Observation):
         self.update()
     
     def reset(self, env_ids):
-        root_ang_vel_b = self.asset.data.root_link_ang_vel_b[env_ids]
-        root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
-        if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
-        self.buffer[env_ids] = root_ang_vel_b
+        self.buffer[env_ids] = 0
 
     def update(self):
-        root_ang_vel_b = self.asset.data.root_link_ang_vel_b
+        root_ang_vel_b = self.imu_ang_vel_sensor.data
         if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+            root_ang_vel_b = add_spherical_noise(root_ang_vel_b, self.noise_std)
         self.buffer = self.buffer.roll(1, dims=1)
         self.buffer[:, 0] = root_ang_vel_b
 
@@ -145,29 +144,75 @@ class root_angvel_b_history(Observation):
         transform = sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[-1., 1., -1.])
         return transform.repeat(len(self.history_steps))
 
+class root_linacc_b_history(Observation):
+    def __init__(self, env, noise_std: float=0., bias_noise_std: float=0., history_steps: list[int]=[0]):
+        super().__init__(env)
+        self.imu_lin_acc_sensor: BuiltinSensor = self.env.scene["robot/imu_lin_acc"]
+        self.noise_std = max(noise_std, 0.)
+        self.bias_noise_std = max(bias_noise_std, 0.)
+        self.history_steps = history_steps
+        buffer_size = max(history_steps) + 1
+        self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device, dtype=self.imu_lin_acc_sensor.data.dtype)
+        self.bias = torch.zeros((self.num_envs, 3), device=self.device, dtype=self.imu_lin_acc_sensor.data.dtype)
+        self.update()
+
+    def reset(self, env_ids):
+        if self.bias_noise_std > 0:
+            bias = torch.zeros((len(env_ids), 3), device=self.device, dtype=self.bias.dtype)
+            self.bias[env_ids] = add_spherical_noise(bias, self.bias_noise_std)
+        else:
+            self.bias[env_ids] = 0
+        self.buffer[env_ids] = 0
+
+    def update(self):
+        lin_acc_b = self.imu_lin_acc_sensor.data + self.bias
+        if self.noise_std > 0:
+            lin_acc_b = add_spherical_noise(lin_acc_b, self.noise_std)
+        self.buffer = self.buffer.roll(1, dims=1)
+        self.buffer[:, 0] = lin_acc_b
+
+    def compute(self) -> torch.Tensor:
+        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+
+    def symmetry_transforms(self):
+        transform = sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1., -1., 1.])
+        return transform.repeat(len(self.history_steps))
+
 class projected_gravity_history(Observation):
-    def __init__(self, env, noise_std: float=0., history_steps: list[int]=[1]):
+    def __init__(
+        self,
+        env,
+        noise_std: float=0.,
+        history_steps: list[int]=[1],
+        bias_noise_std: float=0.,
+    ):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
         self.noise_std = noise_std
+        self.bias_noise_std = max(bias_noise_std, 0.)
         self.history_steps = history_steps
         buffer_size = max(history_steps) + 1
         self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
+        self.bias_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float32)
+        self.bias_quat[:, 0] = 1.0
+        self._gravity_vec_w = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=torch.float32).unsqueeze(0)
         self.update()
     
     def reset(self, env_ids):
-        projected_gravity_b = self.asset.data.projected_gravity_b[env_ids]
-        projected_gravity_b = projected_gravity_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
-        if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
-            projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
-        self.buffer[env_ids] = self.asset.data.projected_gravity_b[env_ids].unsqueeze(1)
+        base_quat = torch.zeros((len(env_ids), 4), device=self.device, dtype=self.asset.data.root_link_quat_w.dtype)
+        base_quat[:, 0] = 1.0
+        if self.bias_noise_std > 0:
+            base_quat = perturb_quaternion(base_quat, self.bias_noise_std)
+        self.bias_quat[env_ids] = base_quat
+
+        self.buffer[env_ids] = 0
     
     def update(self):
-        projected_gravity_b = self.asset.data.projected_gravity_b
+        root_quat = quat_mul(self.bias_quat, self.asset.data.root_link_quat_w)
         if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
-            projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
+            root_quat = perturb_quaternion(root_quat, self.noise_std)
+        projected_gravity_b = quat_apply_inverse(root_quat, self._gravity_vec_w.expand(self.num_envs, -1))
+        projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         self.buffer = self.buffer.roll(1, dims=1)
         self.buffer[:, 0] = projected_gravity_b
     
@@ -189,11 +234,7 @@ class root_linvel_b_history(Observation):
         self.update()
 
     def reset(self, env_ids):
-        root_linvel_b = self.asset.data.root_link_lin_vel_b[env_ids]
-        root_linvel_b = root_linvel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
-        if self.noise_std > 0:
-            root_linvel_b = random_noise(root_linvel_b, self.noise_std)
-        self.buffer[env_ids] = root_linvel_b
+        self.buffer[env_ids] = 0
 
     def update(self):
         root_linvel_b = self.asset.data.root_link_lin_vel_b
@@ -287,7 +328,7 @@ class joint_pos_history(JointObs):
         self.joint_pos[:, substep % 2] = self.asset.data.joint_pos[:, self.joint_ids]
     
     def reset(self, env_ids):
-        self.buffer[env_ids] = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)].unsqueeze(1)
+        self.buffer[env_ids] = 0
     
     def update(self):
         self.buffer = self.buffer.roll(1, 1)
@@ -300,6 +341,44 @@ class joint_pos_history(JointObs):
         joint_pos = self.buffer - self.joint_pos_offset[:, self.joint_ids].unsqueeze(1)
         joint_pos_selected = joint_pos[:, self.history_steps]
         return joint_pos_selected.reshape(self.num_envs, -1)
+
+    def symmetry_transforms(self):
+        transform = sym_utils.joint_space_symmetry(self.asset, self.joint_names)
+        return transform.repeat(len(self.history_steps))
+
+class joint_vel_history(JointObs):
+    def __init__(
+        self,
+        env,
+        joint_names: str=".*",
+        history_steps: list[int]=[1],
+        noise_std: float=0.,
+    ):
+        super().__init__(env, joint_names)
+        self.history_steps = history_steps
+        self.buffer_size = max(history_steps) + 1
+        self.noise_std = max(noise_std, 0.)
+
+        shape = (self.num_envs, self.buffer_size, self.num_joints)
+        self.joint_vel = torch.zeros(self.num_envs, 2, self.num_joints, device=self.device)
+        self.buffer = torch.zeros(shape, device=self.device)
+
+    def post_step(self, substep):
+        self.joint_vel[:, substep % 2] = self.asset.data.joint_vel[:, self.joint_ids]
+
+    def reset(self, env_ids):
+        self.buffer[env_ids] = 0
+
+    def update(self):
+        self.buffer = self.buffer.roll(1, 1)
+        joint_vel = self.joint_vel.mean(1)
+        if self.noise_std > 0:
+            joint_vel = random_noise(joint_vel, self.noise_std)
+        self.buffer[:, 0] = joint_vel
+
+    def compute(self):
+        joint_vel_selected = self.buffer[:, self.history_steps]
+        return joint_vel_selected.reshape(self.num_envs, -1)
 
     def symmetry_transforms(self):
         transform = sym_utils.joint_space_symmetry(self.asset, self.joint_names)
@@ -433,4 +512,6 @@ def symlog(x: torch.Tensor, a: float=1.):
     return x.sign() * torch.log(x.abs() * a + 1.) / a
 
 def random_noise(x: torch.Tensor, std: float):
-    return x + torch.randn_like(x).clamp(-3., 3.) * std
+    if std <= 0.0:
+        return x
+    return x + (torch.rand_like(x) * 2.0 - 1.0) * std

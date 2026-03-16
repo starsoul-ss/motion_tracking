@@ -20,10 +20,10 @@ from active_adaptation.utils.math import (
     quat_mul,
     quat_conjugate,
     axis_angle_from_quat,
-    quat_from_angle_axis,
     yaw_quat,
     matrix_from_quat
 )
+from .utils import add_spherical_noise, clamp_norm, perturb_quaternion
 from .base import Command
 import re
 import math
@@ -122,6 +122,7 @@ class MotionTrackingCommand(Command):
                 dataset_extra_keys: list[dict] = [],
                 keypoint_map: dict = {},
                 keypoint_patterns: list[str] = [],
+                policy_keypoint_patterns: list[str] = [],
                 lower_keypoint_patterns: list[str] = [],
                 upper_keypoint_patterns: list[str] = [],
                 joint_patterns: list[str] = [],
@@ -136,6 +137,7 @@ class MotionTrackingCommand(Command):
                 init_noise: dict[str, float] = {},
                 reward_sigma: dict[str, list[float]] = {},
                 future_steps: list[int] = [],
+                student_future_steps: list[int] | None = None,
                 cum_root_pos_scale: float = 0.0,
                 cum_keypoint_scale: float = 0.0,
                 cum_orientation_scale: float = 0.0,
@@ -149,7 +151,26 @@ class MotionTrackingCommand(Command):
                 debug_mode: bool = False,):
         super().__init__(env)
         
-        self.future_steps = torch.tensor(future_steps, device=self.device)
+        self.future_steps = torch.tensor(future_steps, device=self.device, dtype=torch.long)
+        if student_future_steps is None:
+            student_future_steps = future_steps
+        self.student_future_steps = torch.tensor(
+            student_future_steps, device=self.device, dtype=torch.long
+        )
+        if self.future_steps.numel() == 0:
+            raise ValueError("future_steps must contain at least one element, and should include 0.")
+        if self.student_future_steps.numel() == 0:
+            raise ValueError("student_future_steps must contain at least one element, and should include 0.")
+        if self.future_steps[0].item() != 0:
+            raise ValueError(f"future_steps[0] must be 0, got {self.future_steps.tolist()}")
+        if self.student_future_steps[0].item() != 0:
+            raise ValueError(
+                f"student_future_steps[0] must be 0, got {self.student_future_steps.tolist()}"
+            )
+        # Used for init-time upper bound on t. Negative steps do not constrain the future horizon.
+        self.max_future_step = torch.clamp_min(
+            torch.cat([self.future_steps, self.student_future_steps]), 0
+        ).max()
 
         self.zero_init_prob = 0.0
 
@@ -183,6 +204,7 @@ class MotionTrackingCommand(Command):
 
         # bodies for full‑body keypoint tracking
         self.keypoint_patterns = keypoint_patterns
+        self.policy_keypoint_patterns = policy_keypoint_patterns
         self.lower_keypoint_patterns = lower_keypoint_patterns
         self.upper_keypoint_patterns = upper_keypoint_patterns
         self.keypoint_map = keypoint_map
@@ -207,6 +229,14 @@ class MotionTrackingCommand(Command):
             name_map=self.keypoint_map,
             device=self.device
         )
+        self.policy_keypoint_idx_motion, self.policy_keypoint_idx_asset = _match_indices(
+            self.dataset.body_names,
+            self.asset.body_names,
+            self.policy_keypoint_patterns,
+            name_map=self.keypoint_map,
+            device=self.device
+        )
+        self.policy_keypoint_names = get_items_by_index(self.asset.body_names, self.policy_keypoint_idx_asset)
 
         # joints for full‑body joint tracking
         self.joint_patterns = joint_patterns
@@ -252,6 +282,16 @@ class MotionTrackingCommand(Command):
             device=self.device,
             context="asset canonical order",
         )
+        joint_dtype = self.asset.data.joint_pos.dtype
+        body_dtype = self.asset.data.body_link_pos_w.dtype
+        self._target_joint_pos_bias = torch.zeros(
+            self.num_envs,
+            len(self.target_joint_names),
+            device=self.device,
+            dtype=joint_dtype,
+        )
+        self._root_drift_vel_w = torch.zeros(self.num_envs, 3, device=self.device, dtype=body_dtype)
+        self._root_z_offset = torch.zeros(self.num_envs, device=self.device, dtype=body_dtype)
 
         self.last_reset_env_ids = None
 
@@ -293,6 +333,47 @@ class MotionTrackingCommand(Command):
         ## reward sigma
         self.reward_sigma = reward_sigma
 
+    def _steps_for_horizon(self, horizon: str = "teacher") -> torch.Tensor:
+        horizon_key = str(horizon).lower()
+        if horizon_key == "teacher":
+            return self.future_steps
+        if horizon_key == "student":
+            return self.student_future_steps
+        raise ValueError(f"Invalid horizon '{horizon}', expected 'teacher' or 'student'.")
+
+    def _motion_for_horizon(self, horizon: str = "teacher"):
+        horizon_key = str(horizon).lower()
+        if horizon_key == "teacher":
+            return self._motion
+        if horizon_key == "student":
+            return self._motion_student
+        raise ValueError(f"Invalid horizon '{horizon}', expected 'teacher' or 'student'.")
+
+    def _motion_original_for_horizon(self, horizon: str = "teacher"):
+        horizon_key = str(horizon).lower()
+        if horizon_key == "teacher":
+            if not hasattr(self, "_motion_original"):
+                raise RuntimeError(
+                    "source='original' requires original motion cache, but '_motion_original' is missing."
+                )
+            return self._motion_original
+        if horizon_key == "student":
+            if not hasattr(self, "_motion_original_student"):
+                raise RuntimeError(
+                    "source='original' with horizon='student' requires '_motion_original_student', but it is missing."
+                )
+            return self._motion_original_student
+        raise ValueError(f"Invalid horizon '{horizon}', expected 'teacher' or 'student'.")
+
+    def _apply_root_drift(self, root_pos_w: torch.Tensor, horizon: str = "teacher"):
+        if str(horizon).lower() != "student":
+            return root_pos_w
+        steps = self._steps_for_horizon(horizon).to(device=root_pos_w.device, dtype=root_pos_w.dtype)
+        offsets = steps.view(1, -1, 1) * float(self.env.step_dt)
+        root_pos_w = root_pos_w + self._root_drift_vel_w.to(dtype=root_pos_w.dtype).unsqueeze(1) * offsets
+        root_pos_w[..., 2] = root_pos_w[..., 2] + self._root_z_offset.to(dtype=root_pos_w.dtype).unsqueeze(1)
+        return root_pos_w
+
     def sample_init(self, env_ids: torch.Tensor):
         t = self.t[env_ids]
         self.last_reset_env_ids = env_ids
@@ -313,7 +394,7 @@ class MotionTrackingCommand(Command):
                 self._reinit_requested[env_ids] = False
 
             # --- 2) random sample: uniform in [0, sample_interval), with zero_init_prob chance of t=0 ---
-            max_start = (lengths - self.future_steps[-1] - 1).clamp_min(0)
+            max_start = (lengths - self.max_future_step.to(lengths.dtype) - 1).clamp_min(0)
             sample_interval = torch.minimum(max_start * 3 // 4, max_start - 100).clamp_min(0)
             t_rand = (torch.rand(n, device=self.device) * sample_interval.to(torch.float32)).floor().to(self.t.dtype)
             zero_init = torch.rand(n, device=self.device) < self.zero_init_prob
@@ -338,7 +419,6 @@ class MotionTrackingCommand(Command):
         init_joint_pos = self.init_joint_pos[env_ids].clone()
         init_joint_vel = self.init_joint_vel[env_ids].clone()
         env_origins = self.env.scene.env_origins[env_ids]
-        num_envs = len(env_ids)
 
         # Extract motion data
         motion_root_pos = motion.root_pos_w[:, 0]
@@ -356,10 +436,9 @@ class MotionTrackingCommand(Command):
         init_root_state[:, :3] += root_pos_noise
 
         init_root_state[:, 3:7] = motion_root_quat
-        random_axis = torch.rand(num_envs, 3, device=self.device)
-        random_angle = torch.randn(num_envs, device=self.device).clamp(-1, 1) * self.init_noise_params["root_ori"]
-        random_quat = quat_from_angle_axis(random_angle, random_axis)
-        init_root_state[:, 3:7] = quat_mul(random_quat, init_root_state[:, 3:7])
+        init_root_state[:, 3:7] = perturb_quaternion(
+            init_root_state[:, 3:7], self.init_noise_params["root_ori"]
+        )
 
         init_root_state[:, 7:10] = motion_root_lin_vel
         lin_vel_noise = torch.randn_like(init_root_state[:, 7:10]).clamp(-1, 1) * self.init_noise_params["root_lin_vel"]
@@ -424,28 +503,22 @@ class MotionTrackingCommand(Command):
         return exceed
 
     @observation
-    def command_obs(self, noise_std: float = 0.0):
+    def command_obs(self, noise_std: float = 0.0, horizon: str = "teacher", target_quat_noise_std: float = 0.0, target_pos_noise_std: float = 0.0):
+        motion = self._motion_for_horizon(horizon)
         root_quat = self.asset.data.root_link_quat_w
         if noise_std > 0.0:
-            noise_axis = torch.randn(
-                (self.num_envs, 3),
-                device=self.device,
-                dtype=root_quat.dtype,
-            )
-            noise_axis = noise_axis / noise_axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            noise_angle = torch.randn(
-                (self.num_envs,),
-                device=self.device,
-                dtype=root_quat.dtype,
-            ).clamp(-3, 3) * noise_std
-            noise_quat = quat_from_angle_axis(noise_angle, noise_axis)
-            root_quat = quat_mul(noise_quat, root_quat)
+            root_quat = perturb_quaternion(root_quat, noise_std)
         root_quat = root_quat.unsqueeze(1)
-        root_quat_future = self._motion.root_quat_w[:, 0:, :]
-        root_quat_future0 = self._motion.root_quat_w[:, 0, :].unsqueeze(1)
+        root_quat_future = motion.root_quat_w[:, 0:, :].clone()
+        if target_quat_noise_std > 0.0:
+            root_quat_future = perturb_quaternion(root_quat_future, target_quat_noise_std)
+        root_quat_future0 = root_quat_future[:, 0, :].unsqueeze(1)
 
-        root_pos_future = self._motion.root_pos_w[:, 1:, :]
-        root_pos_future0 = self._motion.root_pos_w[:, 0, :].unsqueeze(1)
+        root_pos_w = self._apply_root_drift(motion.root_pos_w.clone(), horizon)
+        if target_pos_noise_std > 0.0:
+            root_pos_w = add_spherical_noise(root_pos_w, target_pos_noise_std)
+        root_pos_future = root_pos_w[:, 1:, :]
+        root_pos_future0 = root_pos_w[:, 0, :].unsqueeze(1)
 
         # pos diff is applied in expected root frame
         pos_diff_b = quat_apply_inverse(
@@ -465,20 +538,26 @@ class MotionTrackingCommand(Command):
             rot6d_diff.reshape(self.num_envs, -1),
         ], dim=-1)
 
-    def command_obs_sym(self):
+    def command_obs_sym(self, horizon: str = "teacher"):
+        steps = self._steps_for_horizon(horizon)
         return sym_utils.SymmetryTransform.cat([
-            sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]).repeat(len(self.future_steps) - 1),
+            sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]).repeat(len(steps) - 1),
             sym_utils.SymmetryTransform(
                 perm=torch.arange(6),
                 signs=[1, -1, 1, -1, 1, -1]
-            ).repeat(len(self.future_steps)),
+            ).repeat(len(steps)),
         ])
 
     @observation
-    def target_root_z_obs(self):
-        return self._motion.root_pos_w[:, :, 2].reshape(self.num_envs, -1)
-    def target_root_z_obs_sym(self):
-        return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1]).repeat(len(self.future_steps))
+    def target_root_z_obs(self, horizon: str = "teacher", target_noise_std: float = 0.0):
+        motion = self._motion_for_horizon(horizon)
+        target_root_z = self._apply_root_drift(motion.root_pos_w.clone(), horizon)[:, :, 2]
+        if target_noise_std > 0.0:
+            target_root_z = random_noise(target_root_z, target_noise_std)
+        return target_root_z.reshape(self.num_envs, -1)
+    def target_root_z_obs_sym(self, horizon: str = "teacher"):
+        steps = self._steps_for_horizon(horizon)
+        return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1]).repeat(len(steps))
 
 
     @observation
@@ -535,16 +614,21 @@ class MotionTrackingCommand(Command):
         ).repeat(len(self.future_steps))
 
     @observation
-    def target_projected_gravity_b_obs(self):
+    def target_projected_gravity_b_obs(self, horizon: str = "teacher", target_noise_std: float = 0.0):
+        motion = self._motion_for_horizon(horizon)
         gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=torch.float32).reshape(1, 1, 3)
-        g_b = quat_apply_inverse(self._motion.root_quat_w, gravity)  # [N, S, 3]
+        target_root_quat = motion.root_quat_w
+        if target_noise_std > 0.0:
+            target_root_quat = perturb_quaternion(target_root_quat, target_noise_std)
+        g_b = quat_apply_inverse(target_root_quat, gravity)  # [N, S, 3]
         return g_b.reshape(self.num_envs, -1)
 
-    def target_projected_gravity_b_obs_sym(self):
+    def target_projected_gravity_b_obs_sym(self, horizon: str = "teacher"):
+        steps = self._steps_for_horizon(horizon)
         return sym_utils.SymmetryTransform(
             perm=torch.arange(3),
             signs=[1., -1., 1.]
-        ).repeat(len(self.future_steps))
+        ).repeat(len(steps))
 
     @observation
     def target_keypoints_pos_b_obs(self):
@@ -575,6 +659,38 @@ class MotionTrackingCommand(Command):
             sign=[1, -1, 1],
         ).repeat(len(self.future_steps))
         return sym_utils.SymmetryTransform.cat([transform, transform])
+
+    @observation
+    def target_policy_keypoints_pos_b_obs(self, horizon: str = "teacher", source: str = "modified", target_noise_std: float = 0.0):
+        motion = self._motion_for_horizon(horizon)
+        if source == "modified":
+            body_pos_w = motion.body_pos_w[:, :, self.policy_keypoint_idx_motion]
+        elif source == "original":
+            motion_original = self._motion_original_for_horizon(horizon)
+            body_pos_w = motion_original.body_pos_w[:, :, self.policy_keypoint_idx_motion]
+        else:
+            raise ValueError(
+                f"Invalid source '{source}', expected 'modified' or 'original'."
+            )
+        target_w = (
+            body_pos_w
+            - motion.root_pos_w[:, 0:1, :].unsqueeze(2)
+        )
+        target_b = quat_apply_inverse(
+            motion.root_quat_w[:, 0:1, :].unsqueeze(2),
+            target_w,
+        )
+        if target_noise_std > 0.0:
+            target_b = add_spherical_noise(target_b, target_noise_std)
+        return target_b.reshape(self.num_envs, -1)
+
+    def target_policy_keypoints_pos_b_obs_sym(self, horizon: str = "teacher", source: str = "modified"):
+        steps = self._steps_for_horizon(horizon)
+        return sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.policy_keypoint_idx_asset),
+            sign=[1, -1, 1],
+        ).repeat(len(steps))
 
     @observation
     def target_keypoints_rot_b_obs(self):
@@ -611,8 +727,23 @@ class MotionTrackingCommand(Command):
         return sym_utils.SymmetryTransform.cat([transform, transform])
 
     @observation
-    def target_joint_pos_obs(self, noise_std: float = 0.0):
-        target_joint_pos = self._motion.joint_pos[:, :, self.target_joint_idx_motion]
+    def target_joint_pos_obs(self, noise_std: float = 0.0, horizon: str = "teacher", source: str = "modified", target_noise_std: float = 0.0, use_bias: bool = False):
+        if source == "modified":
+            target_joint_pos = self._motion_for_horizon(horizon).joint_pos[
+                :, :, self.target_joint_idx_motion
+            ]
+        elif source == "original":
+            target_joint_pos = self._motion_original_for_horizon(horizon).joint_pos[
+                :, :, self.target_joint_idx_motion
+            ]
+        else:
+            raise ValueError(
+                f"Invalid source '{source}', expected 'modified' or 'original'."
+            )
+        if use_bias:
+            target_joint_pos = target_joint_pos + self._target_joint_pos_bias.unsqueeze(1)
+        if target_noise_std > 0.0:
+            target_joint_pos = random_noise(target_joint_pos, target_noise_std)
         current_joint_pos = self.asset.data.joint_pos[:, self.target_joint_idx_asset] - self.env.action_manager.offset[:, self.target_joint_idx_asset]
         if noise_std > 0.0:
             current_joint_pos = random_noise(current_joint_pos, noise_std)
@@ -625,9 +756,10 @@ class MotionTrackingCommand(Command):
             ],
             dim=-1,
         )
-    def target_joint_pos_obs_sym(self):
+    def target_joint_pos_obs_sym(self, horizon: str = "teacher", source: str = "modified"):
+        steps = self._steps_for_horizon(horizon)
         transform = sym_utils.joint_space_symmetry(self.asset, self.target_joint_names).repeat(
-            len(self.future_steps)
+            len(steps)
         )
         return sym_utils.SymmetryTransform.cat([transform, transform])
 
@@ -890,6 +1022,12 @@ class MotionTrackingCommand(Command):
         self.boot_indicator[:] = torch.clamp_min(self.boot_indicator - 1, 0)
 
         self._motion = self.dataset.get_slice(None, self.t, steps=self.future_steps)
+        if torch.equal(self.student_future_steps, self.future_steps):
+            self._motion_student = self._motion
+        else:
+            self._motion_student = self.dataset.get_slice(
+                None, self.t, steps=self.student_future_steps
+            )
 
         feet_vel_w = self._motion.body_vel_w[:, 0, self.feet_idx_motion, :]
         feet_pos_w = self._motion.body_pos_w[:, 0, self.feet_idx_motion, :]
@@ -970,8 +1108,6 @@ class MotionTrackingCommand(Command):
                     size=20.0,
                 )
 
-from .utils import clamp_norm, rand_points_isotropic
-
 class MotionTrackingComplianceCommand(MotionTrackingCommand):
     def __init__(
         self,
@@ -1009,7 +1145,7 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
         self.force_threshold = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         self.force_kp = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         self._motion_modified_mask = torch.zeros(
-            (self.num_envs, len(self.future_steps)), dtype=torch.bool, device=self.device
+            (self.num_envs, 1), dtype=torch.bool, device=self.device
         )
 
         self.upper_force_keypoint_patterns = upper_force_keypoint_patterns
@@ -1060,7 +1196,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
             fk_asset=self.asset,
             fk_base_body_name=modify_fk_base_body_name,
             fk_ee_link_names=modify_fk_ee_link_names,
-            backup_body_idx_motion=self.upper_force_keypoint_idx_motion,
         )
         self.modify_suitable_flags = self._compute_modify_suitable_flags()
         self.step_schedule(0.0, None)
@@ -1125,27 +1260,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
         self.dataset.modify_joint(due_env_ids, modify_env_ids)
 
     @observation
-    def raw_target_joint_pos_obs(self, noise_std: float = 0.0):
-        target_joint_pos = self._motion_original.joint_pos[:, :, self.target_joint_idx_motion]
-        current_joint_pos = self.asset.data.joint_pos[:, self.target_joint_idx_asset] - self.env.action_manager.offset[:, self.target_joint_idx_asset]
-        if noise_std > 0.0:
-            current_joint_pos = random_noise(current_joint_pos, noise_std)
-        current_joint_pos = current_joint_pos.unsqueeze(1) # N, 1, J
-        target_minus_current = target_joint_pos - current_joint_pos # N, T, J
-        return torch.cat(
-            [
-                target_joint_pos.reshape(self.num_envs, -1),
-                target_minus_current.reshape(self.num_envs, -1),
-            ],
-            dim=-1,
-        )
-    def raw_target_joint_pos_obs_sym(self):
-        transform = sym_utils.joint_space_symmetry(self.asset, self.target_joint_names).repeat(
-            len(self.future_steps)
-        )
-        return sym_utils.SymmetryTransform.cat([transform, transform])
-    
-    @observation
     def compliance_flag_obs(self):
         flag = self.compliance_flag.float().unsqueeze(-1)
         return torch.cat(
@@ -1177,12 +1291,24 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
     def before_update(self):
         super().before_update()
         self.modify_countdown -= 1
-        self._motion_original = self.dataset.get_slice_original(None, self.t, steps=self.future_steps)
-        self._motion_modified_mask = self.dataset.get_slice_modified_mask(None, self.t, steps=self.future_steps)
+        self._motion_original = self.dataset.get_slice_original(
+            None, self.t, steps=self.future_steps
+        )
+        if torch.equal(self.student_future_steps, self.future_steps):
+            self._motion_original_student = self._motion_original
+        else:
+            self._motion_original_student = self.dataset.get_slice_original(
+                None, self.t, steps=self.student_future_steps
+            )
+        self._motion_modified_mask = self.dataset.get_slice_modified_mask(None, self.t, steps=1)
     
     def step(self, substep):
         super().step(substep)
-        raw_target_pos_torso = quat_apply_inverse(self._motion.body_quat_w[:, 0, self.torso_idx_motion], self._motion_original.body_pos_w[:, 0] - self._motion.body_pos_w[:, 0, self.torso_idx_motion])
+        raw_target_pos_torso = quat_apply_inverse(
+            self._motion.body_quat_w[:, 0, self.torso_idx_motion],
+            self._motion_original.body_pos_w[:, 0, self.upper_force_keypoint_idx_motion]
+            - self._motion.body_pos_w[:, 0, self.torso_idx_motion],
+        )
         modified_target_pos_torso = quat_apply_inverse(self._motion.body_quat_w[:, 0, self.torso_idx_motion], self._motion.body_pos_w[:, 0, self.upper_force_keypoint_idx_motion] - self._motion.body_pos_w[:, 0, self.torso_idx_motion])
         current_target_pos_torso = quat_apply_inverse(
             self.asset.data.body_link_quat_w[:, self.torso_idx_asset],
@@ -1198,7 +1324,7 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
             self.asset.data.body_link_quat_w[:, self.torso_idx_asset],
             upper_force_applied_torso
         )
-        dist = rand_points_isotropic(current_target_pos_torso.shape[0], current_target_pos_torso.shape[1], 0.02, device=self.device)
+        dist = add_spherical_noise(torch.zeros_like(current_target_pos_torso), 0.02)
         torque_pull = self.upper_force_applied.cross(dist, dim=-1)
 
         # Limit net wrench about torso and compensate exceeded part on torso.
@@ -1246,7 +1372,10 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
             )
         if not hasattr(self, "_motion_original"):
             return
-        origin_upper_pos_w = self._motion_original.body_pos_w[:, 0] + self.env.scene.env_origins.unsqueeze(1)
+        origin_upper_pos_w = (
+            self._motion_original.body_pos_w[:, 0, self.upper_force_keypoint_idx_motion]
+            + self.env.scene.env_origins.unsqueeze(1)
+        )
         self.env.debug_draw.point(
             origin_upper_pos_w.reshape(-1, 3),
             color=(0, 1, 0, 1),

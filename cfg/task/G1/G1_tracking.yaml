@@ -20,20 +20,21 @@ action:
     .*knee.*: 0.5
     .*waist.*: 0.5
     .*ankle.*: 0.5
-  alpha: [0.9, 0.9]
-  max_delay: 3
+  alpha: [0.8, 1.0]
+  max_delay: 2
   delay_full_progress: 0.8
   boot_protect: True
-  boot_delay_steps: 6
+  boot_delay_steps: 2
 
 flags: []
 command:
   _target_: active_adaptation.envs.mdp.commands.motion_tracking.MotionTrackingComplianceCommand
   keypoint_map: {}
-  keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link", ".*knee.*", ".*ankle_roll_link"]
-  lower_keypoint_patterns: [".*knee.*", ".*ankle_roll_link"]
+  keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link", ".*hip_yaw_link", ".*knee.*", ".*ankle_roll_link"]
+  lower_keypoint_patterns: [".*knee.*", ".*hip_yaw_link", ".*ankle_roll_link"]
   upper_keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link"]
   feet_patterns: ["left_ankle_roll_link", "right_ankle_roll_link"]
+  policy_keypoint_patterns: [".*ankle_roll_link", ".*_hand_mimic"]
   feet_standing_z_enter: 0.18
   feet_standing_z_exit: 0.25
   feet_standing_vxy_enter: 0.2
@@ -48,13 +49,16 @@ command:
       - amass_all
       - 100style
       - amass_hard
+      - real_vr
     path_weights:
       - 0.3
       - 0.3
       - 0.3
       - 0.1
+      - 0.1
   dataset_extra_keys: []
-  future_steps: [0, 2, 4, 8, 16]
+  future_steps: [0, 1, 2, 4, 8, 12, 16, 20, -1, -2, -4, -8]
+  student_future_steps: [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16]
   cum_root_pos_scale: 1.5
   cum_keypoint_scale: 0.25
   cum_orientation_scale: 0.7
@@ -91,17 +95,21 @@ command:
 observation:
   policy:
     boot_indicator_state_obs: {}
-    command_obs: {noise_std: 0.025}
+    command_obs: {noise_std: 0.1, horizon: student, target_quat_noise_std: 0.025, target_pos_noise_std: 0.005}
     compliance_flag_obs: {}
-    raw_target_joint_pos_obs: {noise_std: 0.01}
-    target_root_z_obs: {}
-    target_projected_gravity_b_obs: {}
+    target_joint_pos_obs: {noise_std: 0.015, horizon: student, source: original, target_noise_std: 0.01, use_bias: true}
+    # target_policy_keypoints_pos_b_obs: {horizon: student, source: original, target_noise_std: 0.005, use_bias: true}
+    target_root_z_obs: {horizon: student, target_noise_std: 0.01}
+    target_projected_gravity_b_obs: {horizon: student, target_noise_std: 0.025}
 
-    root_angvel_b_history:     {history_steps: [0], noise_std: 0.05}
-    projected_gravity_history: {history_steps: [0], noise_std: 0.01}
+    root_angvel_b_history:     {history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20], noise_std: 0.2}
+    # root_linacc_b_history:     {history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20], noise_std: 0.2, bias_noise_std: 0.2}
+    projected_gravity_history: {history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20], noise_std: 0.01, bias_noise_std: 0.03}
 
-    joint_pos_history:         {history_steps: [0, 1, 2, 3, 4, 8], noise_std: 0.01}
-    prev_actions:   {steps: 3}
+    joint_pos_history:         {history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20], noise_std: 0.01}
+    joint_vel_history:         {history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20], noise_std: 0.5}
+
+    prev_actions:   {steps: 8}
   priv:
     # tracking
     target_joint_pos_obs: {}
@@ -119,9 +127,10 @@ observation:
     # root
     root_linvel_b_history:     {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
     root_angvel_b_history:     {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
-    projected_gravity_history: {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    projected_gravity_history: {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0, bias_noise_std: 0.0}
     # joint
     joint_pos_history:         {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    joint_vel_history:         {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
     applied_action:   {}
     applied_torque:   {}
     # feet & support
@@ -154,7 +163,7 @@ reward:
     joint_vel_l2:       {weight: 5.0e-4, enabled: true, joint_names: .*}
     action_rate_l2:     {weight: 0.01, enabled: true}
     feet_air_time_ref:  {weight: 5.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], thres: 0.5}
-    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe], air_h_low: 0.035, air_h_high: 0.155, contact_h_low: 0.035, contact_h_high: 0.125}
+    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe], air_h_low: 0.035, air_h_high: 0.125, contact_h_low: 0.035, contact_h_high: 0.125}
     joint_pos_limits:   {weight: 1.0, joint_names: ".*", soft_factor: 0.9, enabled: true}
     joint_torque_limits: {weight: 0.01, joint_names: ".*", soft_factor: 0.75, enabled: true}
     feet_contact_count: {weight: 1.0, enabled: false, body_names: .*ankle_roll_link, }
@@ -162,25 +171,48 @@ reward:
 randomization:
   perturb_body_com:
     body_names: ["pelvis", "torso_link"]
-    com_range: [-0.02, 0.02]
-  perturb_body_mass:
-    pelvis: [0.9, 1.1]
-    torso_link: [0.9, 1.1]
+    com_range: [-0.03, 0.03]
+  # perturb_body_mass:
+  #   pelvis: [0.9, 1.1]
+  #   torso_link: [0.9, 1.1]
   perturb_body_materials:
     body_names: ".*ankle_roll_link"
-    static_friction_range: [0.5, 1.5]
+    static_friction_range: [0.3, 1.2]
     solref_time_constant_range: [0.015, 0.03]
     solref_dampratio_range: [0.5, 2.0]
     homogeneous: true
   motor_params_implicit:
     stiffness_range:
-      .*: [0.8, 1.2]
+      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+      ".*(waist|hip|knee|ankle).*": [0.5, 2.0]
     damping_range:
-      .*: [0.8, 1.2]
+      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+      ".*(waist|hip|knee|ankle).*": [0.5, 2.0]
     armature_range:
       .*: [0.75, 1.25]
   random_joint_offset: 
     .*: [-0.01, 0.01]
+  motion_tracking_target_joint_pos_bias:
+    target_joint_pos_bias_noise_std:
+      ".*(shoulder|elbow|wrist|waist).*": 0.0
+      ".*(hip|knee|ankle).*": 0.1
+  motion_tracking_root_drift_vel:
+    root_drift_vel_xy_max: 0.25
+    root_drift_vel_z_max: 0.05
+  motion_tracking_root_z_offset:
+    z_offset_range: [-0.03, 0.03]
+  perturb_root_vel:
+    min_s: 4.0
+    max_s: 6.0
+    x: [-0.5, 0.5]
+    y: [-0.5, 0.5]
+    z: [-0.2, 0.2]
+    roll: [-0.52, 0.52]
+    pitch: [-0.52, 0.52]
+    yaw: [-0.78, 0.78]
+  perturb_gravity:
+    mean: [0.0, 0.0, -9.81]
+    std: 0.1
 
 termination:
   # cum_error: {thres: 1.0, min_steps: 50}

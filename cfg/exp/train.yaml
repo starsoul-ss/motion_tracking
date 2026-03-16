@@ -20,6 +20,6 @@ task:
   reward:
     loco:
       _scale_factor_: [0.0, 1.0, 0.5, 1.0]
-      joint_acc_l2:       {weight: 2.0e-8, enabled: true, joint_names: .*}
+      joint_acc_l2:       {weight: 4.0e-8, enabled: true, joint_names: .*}
 
 total_frames: 8000_000_000

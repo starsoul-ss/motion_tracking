@@ -110,6 +110,9 @@ class Sim2sim:
         self.renderer = None
         self._viewer_tick = 0
         self.viewer_decim = max(1, self.low_level_freq // 30)  # Default 30 fps for viewer
+        self.imu_lin_acc_adr, self.imu_lin_acc_dim = self._resolve_sensor_slice("imu_lin_acc")
+        if self.imu_lin_acc_adr is None or self.imu_lin_acc_dim < 3:
+            raise ValueError("Missing required MuJoCo sensor 'imu_lin_acc' (accelerometer, dim>=3) in loaded XML.")
 
         self.p_loop_rate = None
 
@@ -166,6 +169,7 @@ class Sim2sim:
 
             low_state.imu_state.quaternion = self.data.qpos[3:7].copy() # Mujoco is wxyz
             low_state.imu_state.gyroscope = self.data.qvel[3:6].copy()
+            low_state.imu_state.accelerometer = self.data.sensordata[self.imu_lin_acc_adr : self.imu_lin_acc_adr + 3].copy()
             low_state.tick = 1
             low_state.crc = CRC().Crc(low_state)
             self.state_pub.Write(low_state)
@@ -191,7 +195,7 @@ class Sim2sim:
         while True:
             ptargets_mujoco = self.real_to_mujoco_mapper.map_action_from_to(self.__ptargets_real)
             # gantry pose
-            self.data.qpos[:7] = [0, 0, 2, 1.0, 0.0, 0.0, 0.0]
+            self.data.qpos[:7] = [0, 0, 2, 0.707, 0.0, 0.0, 0.707]
             self.data.qpos[7:] = ptargets_mujoco
             mujoco.mj_forward(self.model, self.data)
 
@@ -206,7 +210,7 @@ class Sim2sim:
     def simulate_control(self):
         print(f'Running control loop...')
         self.data.qpos[2] = 0.78
-        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]  # Neutral orientation
+        self.data.qpos[3:7] = [0.707, 0.0, 0.0, 0.707]  # Neutral orientation (wxyz)
         mujoco.mj_forward(self.model, self.data)
 
         timer = Timer(self.low_level_dt)
@@ -268,6 +272,12 @@ class Sim2sim:
         if (self._viewer_tick % self.viewer_decim) == 0:
             self.viewer.sync()
         return True
+
+    def _resolve_sensor_slice(self, sensor_name: str):
+        sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, sensor_name)
+        if sid < 0:
+            return None, 0
+        return int(self.model.sensor_adr[sid]), int(self.model.sensor_dim[sid])
 
     def run(self):
         self.state_pub_thread.start()

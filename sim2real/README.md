@@ -1,77 +1,231 @@
+# Sim2Real Runtime
 
-# Sim2Real Deployment
+This repository contains the runtime used to deploy the motion-tracking policy in:
 
-### Install & run with uv (recommended)
-`uv` handles isolated envs + lockfiles; it will auto-read `pyproject.toml` in this folder.
+- `sim2sim`: MuJoCo simulator + high-level controller
+- `sim2real`: Unitree G1 + high-level controller
+
+This environment is only for running the policy side.
+
+Live teleoperation runs in a separate environment. See [`teleop/README.md`](./teleop/README.md).
+
+## What This README Contains
+
+This README is organized as follows:
+
+1. `uv` setup for the policy/runtime environment
+2. how to run `sim2sim`
+3. how to run `sim2real`
+4. what the UDP motion selector is and how to use it
+5. what the VR motion source is and how to use it
+
+## Setup With `uv`
+
+Use `uv` for this repository. Do not create a separate Conda environment for the policy runtime.
 
 ```bash
-cd sim2real
-# create .venv and install deps from pyproject/uv.lock if present
+cd /path/to/sim2real
 uv sync
-
-# run scripts through uv to pick up the venv automatically
-uv run src/sim2sim.py --xml_path assets/g1/g1.xml      # sim bridge
-uv run src/deploy.py --net lo --sim2sim                # controller (sim)
-uv run src/motion_select.py                            # motion selector
 ```
 
-## Install & run with conda (alternative)
-- Create conda environment
-  ```
-  conda create -n gentle python=3.10
-  conda activate gentle
-  ```
-- Install the Unitree SDK2 Python bindings in virtual environment (follow the [official Unitree guide](https://github.com/unitreerobotics/unitree_sdk2_python))
-- Install Python deps:
+That creates the local `.venv` from `pyproject.toml` and `uv.lock`.
+
+Run all scripts through `uv run`:
+
+```bash
+uv run src/sim2sim.py --xml_path assets/g1/g1.xml
+uv run src/deploy.py --net lo --sim2sim
+uv run src/motion_select.py
+```
+
+## Run `sim2sim`
+
+`sim2sim` uses two processes:
+
+1. the simulator / low-level state publisher
+2. the high-level controller
+
+Start the simulator first:
+
+```bash
+cd /path/to/sim2real
+uv run src/sim2sim.py --xml_path assets/g1/g1.xml
+```
+
+Then start the controller in another terminal:
+
+```bash
+cd /path/to/sim2real
+uv run src/deploy.py --net lo --sim2sim
+```
+
+Flow:
+
+1. keep the simulator window focused so the simulated remote input works
+2. press `s` in the simulator to leave zero-torque / move to default pose
+3. once the robot is in the default pose, press `a` in the simulator to start the tracking policy
+4. press `x` to exit
+
+If your motion source is `udp`, also run the motion selector in a third terminal.
+
+If your motion source is `vr`, also run the teleop bridge from [`teleop/README.md`](./teleop/README.md).
+
+## Run `sim2real`
+
+`sim2real` only starts the high-level controller in this repository. The robot hardware side is the real Unitree platform.
+
+Before running:
+
+1. power on G1
+2. connect your PC to the robot over Ethernet
+3. configure the correct network interface on your PC
+4. make sure you know the interface name you want to pass as `--net`
+
+Start the controller:
+
+```bash
+cd /path/to/sim2real
+uv run src/deploy.py --net <robot_iface> --real
+```
+
+Flow:
+
+1. controller starts in zero-torque mode and waits for the remote `start` button
+2. press `start` on the Unitree remote to move the robot to the default pose
+3. place or confirm the robot is safely on the ground
+4. press `A` on the Unitree remote to enter the tracking policy
+5. press `select` on the Unitree remote to exit
+
+Always test a motion in `sim2sim` before running it on the real robot.
+
+## Motion Sources
+
+The tracking policy can consume two kinds of motion sources:
+
+- `udp`
+- `vr`
+
+This is configured in [`config/tracking.yaml`](./config/tracking.yaml) with:
+
+```yaml
+motion_source: "vr"
+```
+
+The current default in this repository is `vr`.
+
+## UDP Motion Selector
+
+### What it is
+
+The UDP motion selector is the offline motion-switching interface.
+
+In this mode, the controller does not consume live teleop data. Instead, it plays motions listed in [`config/tracking.yaml`](./config/tracking.yaml), and you choose which motion to append through a small UDP command tool.
+
+Internally:
+
+- `deploy.py` creates a `UDPMotionSource`
+- `UDPMotionSource` starts a tiny UDP server
+- `motion_select.py` sends motion names to that UDP server
+
+### How to use it
+
+First change the tracking config:
+
+```yaml
+motion_source: "udp"
+```
+
+Then run the normal controller flow:
+
+- `sim2sim`:
   ```bash
-  pip install -r requirements.txt
+  uv run src/sim2sim.py --xml_path assets/g1/g1.xml
+  uv run src/deploy.py --net lo --sim2sim
   ```
-
-## Run Sim2Sim
-1. Start the simulator (state publisher + keyboard bridge):
-   ```bash
-   python3 src/sim2sim.py --xml_path assets/g1/g1.xml
-   ```
-   Leave the terminal focused so the keyboard mapping works.
-2. In another terminal launch the high-level controller:
-   ```bash
-   python3 src/deploy.py --net lo --sim2sim
-   ```
-3. Flow:
-   - Controller waits in zero-torque mode until it receives the simulated state.
-   - Press `s` in the sim terminal to let the robot move to the default pose.
-   - Press `a` in the sim terminal to start tracking policy
-   - See [Motion Switching](#motion-switching) to replay different motions.
-   - Press `x` to exit gracefully.
-
-## Run Sim2Real
-1. Power on G1 and connect to your PC via Ethernet cable.
-   - Set your PC's Ethernet interface to a static IP in the `192.168.123.x` subnet.
-2. Launch the controller pointing at the appropriate interface:
-   ```bash
-   python3 src/deploy.py --net <robot_iface> --real
-   ```
-3. The state machine matches Sim2Sim but with `physical remote controller` input
-   - Zero torque
-   - (Press `start`) → move to default pose
-   - Place robot on the ground
-   - (Press `A`) → run the active policy
-   - See [Motion Switching](#motion-switching) to replay different motions.
-   - (Press `select`) → exit gracefully
-
-**⚠️ Always test motions in Sim2Sim before running them on the real robot.**
-
-**⚠️ Do not blindly trust the RL policy. Always have emergency stop measures and qualified safety personnel on site.**
-
-## Motion Switching
-- The tracking policy accepts motion change commands while it is active.
-- Open a terminal and run the motion selector:
+- `sim2real`:
   ```bash
-  python3 src/motion_select.py
+  uv run src/deploy.py --net <robot_iface> --real
   ```
-- Usage tips:
-  - Type the motion name or its index (`list` prints the menu). Press Enter with an empty line to resend the previous choice.
-  - `r` reloads the YAML file if you edit it; `q` exits the selector.
-- Selection rules:
-  - The policy only starts a new motion when the current clip has finished and the robot is in the `default` clip (or you explicitly request `default`).
-  - Sending `default` always fades back to the idle pose.
+
+Then run the selector in another terminal:
+
+```bash
+cd /path/to/sim2real
+uv run src/motion_select.py
+```
+
+Usage:
+
+- type a motion index or motion name and press Enter
+- type `list` to print all available motions
+- press Enter on an empty line to resend the previous choice
+- type `r` to reload `config/tracking.yaml`
+- type `q` to quit
+
+Behavior:
+
+- `default` returns the policy toward the idle/default pose
+- non-default motions are taken from the `motions:` list in `config/tracking.yaml`
+- switching is append-based rather than an immediate hard cut
+- switching follows the policy-side gating logic:
+  - from `default`, you can switch to any motion
+  - once a non-default motion is active, you cannot jump directly to another non-default motion
+      - a non-default motion must finish first
+      - after it finishes, you can switch back to `default`
+      - only after returning to `default` can you switch to a different motion
+
+## VR Motion Source
+
+### What it is
+
+The VR motion source is the live teleoperation interface.
+
+In this mode, `sim2sim/sim2real` does not receive motion names over UDP. Instead, it requests pose chunks from the teleop bridge over ZMQ.
+
+Internally:
+
+- `deploy.py` creates a `VRMotionSource`
+- `VRMotionSource` connects to the teleop bridge on the ZMQ addresses in [`config/tracking.yaml`](./config/tracking.yaml)
+- `VRMotionSource` maintains the reference-motion buffer
+- when the future horizon drops below the low-water mark, it requests more frames
+- the teleop bridge retargets the latest XR/PICO stream and returns a chunk of frames
+
+The teleop bridge itself is documented in [`teleop/README.md`](./teleop/README.md).
+
+### How to use it
+
+Leave the config as:
+
+```yaml
+motion_source: "vr"
+```
+
+Start the teleop bridge in its own environment by following [`teleop/README.md`](./teleop/README.md).
+
+Then start the controller here as usual:
+
+- `sim2sim`:
+  ```bash
+  uv run src/sim2sim.py --xml_path assets/g1/g1.xml
+  uv run src/deploy.py --net lo --sim2sim
+  ```
+- `sim2real`:
+  ```bash
+  uv run src/deploy.py --net <robot_iface> --real
+  ```
+
+### Buttons
+
+There are two layers of control in VR mode.
+
+Robot-side controller state:
+
+- simulated remote in `sim2sim`: `s` to move to default pose, `a` to start tracking
+- Unitree remote in `sim2real`: `start` to move to default pose, `A` to start tracking
+
+Live teleop control from the XR/PICO side:
+
+- right-hand `A`: start/resume live teleop streaming
+- left-hand `X`: pause live teleop streaming
+
+The XR/PICO installation and teleop-side runtime are intentionally kept out of this `uv` environment. Use the separate setup in [`teleop/README.md`](./teleop/README.md).

@@ -1,23 +1,16 @@
 import json
+import os
 import statistics
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import onnxruntime as ort
-from scipy.spatial.transform import Rotation as R
-
 from common.joint_mapper import create_isaac_to_real_mapper
-from common.math_utils import (
-    _linspace_rows,
-    _remove_yaw_keep_rp_wxyz,
-    _slerp,
-    _yaw_component_wxyz,
-    _zero_z,
-)
-from common.utils import DictToClass, MotionUDPServer
-from paths import ASSETS_DIR, REAL_G1_ROOT
+from common.utils import DictToClass
+from motion_sources import MotionSourceBase, UDPMotionSource, VRMotionSource
+from paths import REAL_G1_ROOT
 
 def benchmark_onnx(module, sample_input, runs=100, warmup=10, desc=""):
     for _ in range(warmup):
@@ -44,8 +37,37 @@ def benchmark_onnx(module, sample_input, runs=100, warmup=10, desc=""):
 
 
 class ONNXModule:
+    CPU_AFFINITY = (4, 5, 6, 7)
+    CPU_THREADS = len(CPU_AFFINITY)
+
+    @classmethod
+    def _bind_process_to_first_cpus(cls) -> None:
+        if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+            return
+        try:
+            allowed = sorted(os.sched_getaffinity(0))
+            target = [cpu for cpu in cls.CPU_AFFINITY if cpu in allowed]
+            if len(target) != len(cls.CPU_AFFINITY):
+                print(
+                    f"[ONNXModule] Requested CPUs {list(cls.CPU_AFFINITY)} but only "
+                    f"{target} are available in current affinity mask {allowed}"
+                )
+            if len(target) >= 1:
+                os.sched_setaffinity(0, set(target))
+                print(f"[ONNXModule] Bound process affinity to CPUs {target}")
+        except Exception as e:
+            print(f"[ONNXModule] Failed to set process affinity: {e}")
+
     def __init__(self, path: str):
-        self.ort_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        self._bind_process_to_first_cpus()
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = self.CPU_THREADS
+        sess_options.inter_op_num_threads = 1
+        self.ort_session = ort.InferenceSession(
+            path,
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
+        )
         meta_path = path.replace(".onnx", ".json")
         with open(meta_path, "r") as f:
             self.meta = json.load(f)
@@ -79,8 +101,6 @@ class Policy:
         self.policy_path = str(p if p.is_absolute() else (REAL_G1_ROOT / p))
         self.action_joint_names = list(policy_cfg.action_joint_names)
         self.action_scale_isaac = np.array(policy_cfg.action_scale, dtype=np.float32)
-        self.alpha = float(policy_cfg.action_alpha)
-        self.lowstate_alpha = float(policy_cfg.lowstate_alpha)
         self.action_clip = float(policy_cfg.action_clip)
 
         if hasattr(policy_cfg, "kps_real"):
@@ -121,6 +141,13 @@ class Policy:
             "policy": np.zeros((1, self.num_obs), dtype=np.float32),
             "is_init": np.ones((1,), dtype=bool)
         }
+        input_shape = self.module.ort_session.get_inputs()[0].shape
+        expected_obs_dim = input_shape[-1] if len(input_shape) > 0 else None
+        if isinstance(expected_obs_dim, int) and expected_obs_dim != self.num_obs:
+            raise ValueError(
+                f"[Policy:{self.name}] Observation dim mismatch: built={self.num_obs}, "
+                f"onnx expects {expected_obs_dim}. Please align tracking.yaml observation settings."
+            )
         benchmark_onnx(self.module, self.policy_input, runs=100, warmup=200, desc="model@cuda")
 
     # -------- lifecycle ----------
@@ -192,107 +219,56 @@ class Policy:
         self.last_action[:] = 0.0
         self._reset_obs_modules()
 
+    def post_step(self):
+        """Hook called once after each policy inference/application step."""
+        return
+
 # =========================================
 # Policy Subclasses
 # =========================================
-def remap_joint_array_by_names(
-    data: np.ndarray,
-    source_joint_names: List[str],
-    target_joint_names: List[str],
-) -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
-    if data.ndim != 2:
-        raise ValueError(f"Expected 2D joint array [T, J], got shape={data.shape}")
-    if data.shape[1] != len(source_joint_names):
-        raise ValueError(
-            f"Joint dim mismatch: data has {data.shape[1]} dims, "
-            f"but source_joint_names has {len(source_joint_names)} names."
-        )
-
-    name_to_idx = {name: i for i, name in enumerate(source_joint_names)}
-    remap = np.zeros((data.shape[0], len(target_joint_names)), dtype=np.float32)
-    for i, name in enumerate(target_joint_names):
-        j = name_to_idx.get(name, None)
-        if j is not None:
-            remap[:, i] = data[:, j]
-    return remap
-
 class TrackingPolicyRaw(Policy):
+    @staticmethod
+    def _parse_future_steps(policy_cfg: DictToClass):
+        if not hasattr(policy_cfg, "future_steps"):
+            raise KeyError("Missing required config key 'future_steps'.")
+        future_steps = np.asarray(getattr(policy_cfg, "future_steps"), dtype=np.int32).reshape(-1)
+        if future_steps.size == 0:
+            raise ValueError("[TrackingPolicyRaw] future_steps must not be empty.")
+        if int(future_steps[0]) != 0:
+            raise ValueError(f"[TrackingPolicyRaw] future_steps[0] must be 0, got {future_steps.tolist()}")
+
+        seen_negative = False
+        for s in future_steps[1:]:
+            if int(s) < 0:
+                seen_negative = True
+            elif seen_negative:
+                raise ValueError(
+                    "[TrackingPolicyRaw] future_steps format must be [0, ...positive/non-negative, ...negative]. "
+                    f"Got: {future_steps.tolist()}"
+                )
+        return future_steps
+
     def __init__(self, name: str, policy_cfg: DictToClass, controller):
         # ---- Config ---------------------------------------------------------
         self.body_name = "torso_link"
         self.transition_steps = int(getattr(policy_cfg, "transition_steps", 100))
-        self.compliance_flag_value = float(getattr(policy_cfg, "compliance_flag_value", 0.0))
-        self.udp_enable = bool(getattr(policy_cfg, "udp_enable", True))
-        self.udp_host = str(getattr(policy_cfg, "udp_host", "127.0.0.1"))
-        self.udp_port = int(getattr(policy_cfg, "udp_port", 28562))
+        self.future_steps = self._parse_future_steps(policy_cfg)
+        self.future_history_len = int(max(0, -int(self.future_steps.min())))
+        configured_tail = int(getattr(policy_cfg, "switch_tail_keep_steps", self.future_history_len))
+        # Keep enough old reference so negative future_steps can access valid history right after a motion switch.
+        self.switch_tail_keep_steps = max(configured_tail, self.future_history_len)
+        self.motion_source = str(getattr(policy_cfg, "motion_source", "udp")).strip().lower()
+        if self.motion_source not in ("udp", "vr"):
+            raise ValueError(f"[TrackingPolicyRaw] motion_source must be 'udp' or 'vr', got '{self.motion_source}'")
+        self.ref_max_len = int(getattr(policy_cfg, "ref_max_len", 2048))
+
         self.dataset_joint_names = list(getattr(policy_cfg, "dataset_joint_names", []))
         if len(self.dataset_joint_names) == 0:
             raise ValueError(
                 "[TrackingPolicyRaw] dataset_joint_names must be provided in tracking.yaml."
             )
         self.obs_joint_names = controller.config.isaac_joint_names_state
-
-        # ---- Load motions; keep all root data (no yaw split) ----------------
-        self.motions: Dict[str, Dict[str, np.ndarray]] = {}
-        for m in policy_cfg.motions:
-            mc = DictToClass(m)
-            motion_name = mc.name
-            mp = Path(mc.path)
-            path = str(mp if mp.is_absolute() else (REAL_G1_ROOT / mp))
-            t0, t1 = int(mc.start), int(mc.end)
-
-            data = np.load(path, allow_pickle=True)
-            if not isinstance(data, np.lib.npyio.NpzFile):
-                raise ValueError(f"[TrackingPolicyRaw] Only .npz is supported: {path}")
-
-            joint_pos = data["dof_pos"][t0:t1].astype(np.float32)
-            root_pos = data["root_pos"][t0:t1].astype(np.float32)
-            root_rot_xyzw = data["root_rot"][t0:t1].astype(np.float32)
-            root_quat = np.concatenate([root_rot_xyzw[:, 3:4], root_rot_xyzw[:, :3]], axis=-1)
-
-            joint_names = data.get("joint_names", None)
-            if joint_names is None:
-                raise ValueError(
-                    f"[TrackingPolicyRaw] Motion '{motion_name}' is missing 'joint_names' in npz. "
-                    "Please export joint_names with the dataset."
-                )
-            source_joint_names = []
-            for n in joint_names.tolist():
-                if isinstance(n, (bytes, np.bytes_)):
-                    source_joint_names.append(n.decode("utf-8"))
-                else:
-                    source_joint_names.append(str(n))
-            joint_pos = remap_joint_array_by_names(joint_pos, source_joint_names, self.obs_joint_names)
-
-            self.motions[motion_name] = {
-                "joint_pos": joint_pos,  # (T,J)
-                "root_quat": root_quat,  # (T,4) wxyz
-                "root_pos": root_pos,    # (T,3)
-            }
-
-        # ---- One-frame motion clips (config provided) ----------------------
-        for m in policy_cfg.motion_clips:
-            mc = DictToClass(m)
-            motion_name = mc.name
-            joint_pos_1 = np.asarray(mc.joint_pos, dtype=np.float32).reshape(1, -1)
-            if joint_pos_1.shape[1] != len(self.dataset_joint_names):
-                raise ValueError(
-                    f"[TrackingPolicyRaw] Motion clip '{motion_name}' dim={joint_pos_1.shape[1]} "
-                    f"does not match dataset_joint_names size={len(self.dataset_joint_names)}."
-                )
-            source_joint_names = self.dataset_joint_names
-            joint_pos_1 = remap_joint_array_by_names(joint_pos_1, source_joint_names, self.obs_joint_names)
-            root_quat_1 = np.asarray(mc.root_quat, dtype=np.float32).reshape(1, 4)
-            root_pos_1 = np.asarray(mc.root_pos, dtype=np.float32).reshape(1, 3)
-
-            self.motions[motion_name] = {
-                "joint_pos": joint_pos_1,  # (1,J)
-                "root_quat": root_quat_1,  # (1,4)
-                "root_pos": root_pos_1,    # (1,3)
-            }
-
-        assert "default" in self.motions, "[TrackingPolicyRaw] motions must include a 'default' clip (length==1)."
+        self.n_joints = len(self.obs_joint_names)
 
         # ---- Reference stream ----------------------------------------------
         self.ref_joint_pos: Optional[np.ndarray] = None  # (T_ref, J)
@@ -305,32 +281,26 @@ class TrackingPolicyRaw(Policy):
         self.current_name: str = "default"
         self.current_done: bool = True  # boot: default done
 
-        # ---- Misc ----------------------------------------------------------
-        self.n_joints = len(self.obs_joint_names)
-
-        # Optional UDP selector
-        self._udp_server: Optional[MotionUDPServer] = None
-        if self.udp_enable:
-            try:
-                self._udp_server = MotionUDPServer(self.udp_host, self.udp_port)
-                self._udp_server.start()
-            except Exception as e:
-                print(f"[TrackingPolicyRaw] Failed to start UDP server: {e}")
+        self.source: MotionSourceBase
+        if self.motion_source == "udp":
+            self.source = UDPMotionSource(self, policy_cfg)
+        else:
+            self.source = VRMotionSource(self, policy_cfg)
+        self.motions = self.source.motions
 
         super().__init__(name, policy_cfg, controller)
         self.init_count = 0
 
     def fade_in(self):
         super().fade_in()
-        self._start_motion_from_current("default")
+        self.source.on_fade_in()
 
     def fade_out(self) -> float:
-        self._start_motion_from_current("default")
+        self.source.on_fade_out()
         return super().fade_out()
 
     def deactivate(self):
-        if self._udp_server is not None:
-            self._udp_server.stop()
+        self.source.deactivate()
         self.ref_root_pos = None
         self.ref_root_quat = None
         self.ref_joint_pos = None
@@ -341,10 +311,13 @@ class TrackingPolicyRaw(Policy):
             TrackingCommandObsRaw,
             TargetRootZObs,
             TargetJointPosObs,
+            TargetPolicyKeypointsPosBObs,
             TargetProjectedGravityBObs,
-            RootAngVelB,
-            ProjectedGravityB,
+            RootAngVelBHistory,
+            RootLinAccBHistory,
+            ProjectedGravityBHistory,
             JointPos,
+            JointVel,
             PrevActions,
             BootIndicator,
             ComplianceFlagObs,
@@ -354,40 +327,32 @@ class TrackingPolicyRaw(Policy):
             TrackingCommandObsRaw(self.controller, self),
             ComplianceFlagObs(self),
             TargetJointPosObs(self),
+            # TargetPolicyKeypointsPosBObs(self),
             TargetRootZObs(self),
             TargetProjectedGravityBObs(self),
-            RootAngVelB(self.controller),
-            ProjectedGravityB(self.controller),
-            JointPos(self.controller, pos_steps=[0, 1, 2, 3, 4, 8]),
-            PrevActions(self, steps=3),
+            RootAngVelBHistory(self.controller, self),
+            # RootLinAccBHistory(self.controller, self),
+            ProjectedGravityBHistory(self.controller, self),
+            JointPos(self.controller, self),
+            JointVel(self.controller, self),
+            PrevActions(self),
         ]
         self.num_obs = sum(m.size for m in self.obs_modules)
 
     def request_motion(self, name: str) -> bool:
-        if name not in self.motions:
-            print(f"[TrackingPolicyRaw] Unknown motion '{name}'")
-            return False
-        if (self.current_name == "default" or name == "default") and self.current_done:
-            self._start_motion_from_current(name)
-            return True
-        else:
-            print(f"[TrackingPolicyRaw] Reject '{name}': current='{self.current_name}', done={self.current_done}")
-            return False
+        request_fn = getattr(self.source, "request_motion", None)
+        if callable(request_fn):
+            return bool(request_fn(name))
+        return False
 
     def update_obs(self):
-        if self._udp_server is not None:
-            for cmd in self._udp_server.pop_all():
-                if cmd == "default":
-                    self.request_motion("default")
-                else:
-                    self.request_motion(cmd)
         if self.ref_len > 0 and self.ref_idx < self.ref_len - 1:
             self.ref_idx += 1
             if self.ref_idx == self.ref_len - 1:
                 self.current_done = True
         super().update_obs()
 
-    def _read_current_state(self) -> Dict[str, np.ndarray]:
+    def read_current_state(self) -> Dict[str, np.ndarray]:
         q_policy = self.controller.qj_isaac.copy().astype(np.float32)
 
         if self.ref_root_pos is not None:
@@ -402,73 +367,80 @@ class TrackingPolicyRaw(Policy):
             "root_quat": root_quat,
         }
 
-    def _align_motion_to_current(
-        self,
-        motion: Dict[str, np.ndarray],
-        curr: Dict[str, np.ndarray],
-    ) -> Dict[str, np.ndarray]:
-        p0 = motion["root_pos"][0]
-        q0_yaw = _yaw_component_wxyz(motion["root_quat"][0])
-        pc = curr["root_pos"]
-        qc_yaw = _yaw_component_wxyz(curr["root_quat"])
+    def read_ref_tail_state(self) -> Dict[str, np.ndarray]:
+        if (
+            self.ref_joint_pos is not None
+            and self.ref_root_quat is not None
+            and self.ref_root_pos is not None
+            and self.ref_len > 0
+        ):
+            return {
+                "joint_pos": self.ref_joint_pos[self.ref_len - 1].astype(np.float32, copy=True),
+                "root_pos": self.ref_root_pos[self.ref_len - 1].astype(np.float32, copy=True),
+                "root_quat": self.ref_root_quat[self.ref_len - 1].astype(np.float32, copy=True),
+            }
+        return self.read_current_state()
 
-        R0 = R.from_quat(q0_yaw, scalar_first=True)
-        Rc = R.from_quat(qc_yaw, scalar_first=True)
-        R_delta = Rc * R0.inv()
+    def append_ref_frames(self, frames: Dict[str, np.ndarray]) -> None:
+        if frames is None:
+            return
 
-        root_pos_aligned = R_delta.apply(motion["root_pos"] - p0) + pc
-        root_pos_aligned[:, 2] = motion["root_pos"][:, 2]  # keep original z
+        j = np.asarray(frames["joint_pos"], dtype=np.float32)
+        q = np.asarray(frames["root_quat"], dtype=np.float32)
+        p = np.asarray(frames["root_pos"], dtype=np.float32)
 
-        root_quat_all = R.from_quat(motion["root_quat"], scalar_first=True)
-        root_quat_aligned = (R_delta * root_quat_all).as_quat(scalar_first=True)
+        if j.ndim == 1:
+            j = j.reshape(1, -1)
+        if q.ndim == 1:
+            q = q.reshape(1, -1)
+        if p.ndim == 1:
+            p = p.reshape(1, -1)
 
-        return {
-            "joint_pos": motion["joint_pos"].astype(np.float32).copy(),
-            "root_quat": root_quat_aligned.astype(np.float32),
-            "root_pos": root_pos_aligned.astype(np.float32),
-        }
+        if j.shape[0] != q.shape[0] or j.shape[0] != p.shape[0]:
+            raise ValueError(f"Frame length mismatch: joint={j.shape}, quat={q.shape}, pos={p.shape}")
+        if j.shape[0] == 0:
+            return
+        if j.shape[1] != self.n_joints:
+            raise ValueError(f"Joint dim mismatch: got={j.shape[1]}, expected={self.n_joints}")
+        if q.shape[1] != 4 or p.shape[1] != 3:
+            raise ValueError(f"Root dim mismatch: quat={q.shape[1]}, pos={p.shape[1]}")
 
-    def _build_transition_prefix(
-        self,
-        curr: Dict[str, np.ndarray],
-        tgt_first: Dict[str, np.ndarray],
-    ) -> Dict[str, np.ndarray]:
-        T = int(self.transition_steps)
-        if T <= 0:
-            raise ValueError("[TrackingPolicyRaw] transition_steps must be > 0")
+        if self.ref_joint_pos is None or self.ref_root_quat is None or self.ref_root_pos is None or self.ref_len <= 0:
+            self.ref_joint_pos = j.copy()
+            self.ref_root_quat = q.copy()
+            self.ref_root_pos = p.copy()
+        else:
+            self.ref_joint_pos = np.concatenate([self.ref_joint_pos, j], axis=0)
+            self.ref_root_quat = np.concatenate([self.ref_root_quat, q], axis=0)
+            self.ref_root_pos = np.concatenate([self.ref_root_pos, p], axis=0)
 
-        joints_tr = _linspace_rows(curr["joint_pos"], tgt_first["joint_pos"], T)
-        root_pos_tr = _linspace_rows(curr["root_pos"], tgt_first["root_pos"], T)
-        root_quat_tr = _slerp(curr["root_quat"], tgt_first["root_quat"], T)
-
-        return {
-            "joint_pos": joints_tr,
-            "root_quat": root_quat_tr,
-            "root_pos": root_pos_tr,
-        }
-
-    def _start_motion_from_current(self, name: str):
-        assert name in self.motions
-        curr = self._read_current_state()
-
-        m = self.motions[name]
-        aligned_motion = self._align_motion_to_current(m, curr)
-
-        tgt_first = {
-            "joint_pos": aligned_motion["joint_pos"][0],
-            "root_quat": aligned_motion["root_quat"][0],
-            "root_pos": aligned_motion["root_pos"][0],
-        }
-
-        trans_motion = self._build_transition_prefix(curr, tgt_first)
-
-        self.ref_joint_pos = np.concatenate([trans_motion["joint_pos"], aligned_motion["joint_pos"]], axis=0)
-        self.ref_root_quat = np.concatenate([trans_motion["root_quat"], aligned_motion["root_quat"]], axis=0)
-        self.ref_root_pos = np.concatenate([trans_motion["root_pos"], aligned_motion["root_pos"]], axis=0)
-
-        self.ref_idx = 0
         self.ref_len = int(self.ref_joint_pos.shape[0])
-        self.current_name = name
-        self.current_done = (self.ref_len <= 1)
+        self.current_done = (self.ref_idx >= self.ref_len - 1)
+        self._trim_ref_prefix()
 
-        print(f"[TrackingPolicyRaw] Start motion '{name}' | ref_len={self.ref_len}, transition={self.transition_steps}")
+    def _trim_ref_prefix(self) -> None:
+        if (
+            self.ref_joint_pos is None
+            or self.ref_root_quat is None
+            or self.ref_root_pos is None
+            or self.ref_len <= 0
+        ):
+            return
+
+        keep_hist = max(self.future_history_len, self.switch_tail_keep_steps) + 2
+        drop = max(0, int(self.ref_idx) - int(keep_hist))
+        if self.ref_max_len > 0:
+            overflow = max(0, int(self.ref_len) - int(self.ref_max_len))
+            drop = max(drop, min(overflow, max(0, int(self.ref_idx) - int(keep_hist))))
+        if drop <= 0:
+            return
+
+        self.ref_joint_pos = self.ref_joint_pos[drop:]
+        self.ref_root_quat = self.ref_root_quat[drop:]
+        self.ref_root_pos = self.ref_root_pos[drop:]
+        self.ref_idx -= drop
+        self.ref_len = int(self.ref_joint_pos.shape[0])
+        self.current_done = (self.ref_idx >= self.ref_len - 1)
+
+    def post_step(self):
+        self.source.post_step()

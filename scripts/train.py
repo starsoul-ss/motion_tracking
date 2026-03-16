@@ -4,7 +4,6 @@ import hydra
 import numpy as np
 
 import einops
-import wandb
 import logging
 import os
 import sys
@@ -27,6 +26,7 @@ from active_adaptation.utils.torchrl import SyncDataCollector, TDTimeBuffer
 from scripts.utils.helpers import make_env_policy, EpisodeStats, evaluate
 from scripts.utils.train_record import TrainStateRecorder
 from torchrl.envs.utils import set_exploration_type, ExplorationType
+from active_adaptation.utils.wandb import finish_wandb_run, init_wandb_run
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -65,19 +65,12 @@ def main(cfg: DictConfig):
 
     need_logging = aa.is_main_process() and cfg.wandb.get("mode", "disabled") != "disabled"
     if need_logging:
-        run = wandb.init(
-            job_type=cfg.wandb.job_type,
-            project=cfg.wandb.project,
-            mode=cfg.wandb.mode,
-            tags=cfg.wandb.tags,
-            id=cfg.wandb.id,
-            notes=cfg.wandb.notes,
-        )
-        run.config.update(OmegaConf.to_container(cfg))
-
         default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
+        run = init_wandb_run(cfg.wandb, config=cfg, name=default_run_name)
+        if run.id:
+            run.name = f"{run.id}-{default_run_name}"
+        else:
+            run.name = default_run_name
         setproctitle(run.name)
 
         cfg_save_path = os.path.join(run.dir, "cfg.yaml")
@@ -90,7 +83,7 @@ def main(cfg: DictConfig):
         source_path = inspect.getfile(policy.__class__)
         target_path = os.path.join(run.dir, source_path.split("/")[-1])
         shutil.copy(source_path, target_path)
-        wandb.save(target_path, policy="now")
+        run.save(target_path, policy="now")
 
         log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
         logging.info(f"Log interval: {log_interval} steps")
@@ -221,13 +214,14 @@ def main(cfg: DictConfig):
         if train_recorder is not None:
             train_recorder.flush()
 
-        save(policy, "checkpoint_final")
+        if need_logging:
+            save(policy, "checkpoint_final")
 
-        policy_eval = policy.get_rollout_policy("eval")
-        info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
-        run.log(info, step = total_iters)
+            policy_eval = policy.get_rollout_policy("eval")
+            info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
+            run.log(info, step = total_iters)
 
-        wandb.finish()
+            finish_wandb_run(run)
     exit(0)
 
 

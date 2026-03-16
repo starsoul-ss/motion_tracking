@@ -10,10 +10,17 @@ def export_onnx(module: ModBase, td: TensorDictBase, path: str, meta=None):
 
     td = td.cpu().select(*module.in_keys, strict=True)
     module = module.cpu()
+    module.eval()
     print(torch.__version__)
-    # breakpoint()
-    onnx_program = torch.onnx.dynamo_export(module, **td.to_dict())
-    onnx_program.save(path)
+    torch.onnx.export(
+        module,
+        args=(),
+        kwargs={k: td[k] for k in module.in_keys},
+        f=path,
+        input_names=list(module.in_keys),
+        output_names=list(module.out_keys),
+        dynamo=True,
+    )
     print(f"Exported ONNX model to {path}.")
 
     import json

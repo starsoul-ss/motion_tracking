@@ -32,11 +32,11 @@ def _build_scene(*, num_envs, device, robot_name, physics_dt, env_spacing, add_p
     from mjlab.scene import Scene, SceneCfg
     from mjlab.sim import MujocoCfg, SimulationCfg
     from mjlab.sim.sim import Simulation
-    from mjlab.terrains.terrain_importer import TerrainImporterCfg
+    from mjlab.terrains import TerrainEntityCfg
 
     scene_cfg = SceneCfg(num_envs=num_envs, env_spacing=env_spacing)
     if add_plane:
-        scene_cfg.terrain = TerrainImporterCfg(
+        scene_cfg.terrain = TerrainEntityCfg(
             terrain_type="plane",
             env_spacing=env_spacing,
             num_envs=num_envs,

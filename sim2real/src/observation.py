@@ -1,8 +1,23 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from common.fk_utils import PolicyKeypointPinFK
 from common.math_utils import _clamp_indices, _quat_apply_inv
-from common.remote_controller import KeyMap
+
+
+def _require_cfg(policy, key: str):
+    cfg = getattr(policy, "config", None)
+    if cfg is None or not hasattr(cfg, key):
+        raise KeyError(f"Missing required config key '{key}' for observation setup.")
+    return getattr(cfg, key)
+
+
+def _policy_future_steps(policy) -> np.ndarray:
+    steps = np.asarray(_require_cfg(policy, "future_steps"), dtype=np.int32).reshape(-1)
+    if steps.size == 0:
+        raise ValueError("future_steps must not be empty.")
+    return steps
+
 
 class BaseObs:
     @property
@@ -15,7 +30,7 @@ class TrackingCommandObsRaw:
         self.ctrl = ctrl
         self.policy = policy
 
-        self.future_steps = np.array([0, 2, 4, 8, 16], dtype=np.int32)
+        self.future_steps = _policy_future_steps(policy)
 
     @property
     def size(self) -> int:
@@ -67,7 +82,7 @@ class TrackingCommandObsRaw:
 class TargetRootZObs:
     def __init__(self, policy):
         self.policy = policy
-        self.future_steps = np.array([0, 2, 4, 8, 16], dtype=np.int32)
+        self.future_steps = _policy_future_steps(policy)
 
     @property
     def size(self) -> int:
@@ -91,7 +106,7 @@ class TargetRootZObs:
 class TargetJointPosObs:
     def __init__(self, policy):
         self.policy = policy
-        self.future_steps = np.array([0, 2, 4, 8, 16], dtype=np.int32)
+        self.future_steps = _policy_future_steps(policy)
 
     @property
     def size(self) -> int:
@@ -124,7 +139,7 @@ class TargetJointPosObs:
 class TargetProjectedGravityBObs:
     def __init__(self, policy):
         self.policy = policy
-        self.future_steps = np.array([0, 2, 4, 8, 16], dtype=np.int32)
+        self.future_steps = _policy_future_steps(policy)
 
     @property
     def size(self) -> int:
@@ -151,37 +166,124 @@ class TargetProjectedGravityBObs:
         g_local = _quat_apply_inv(root_quat_w, g_world)
         return g_local.reshape(-1).astype(np.float32)
 
-class RootAngVelB(BaseObs):
-    def __init__(self, ctrl):
-        self.ctrl = ctrl
+
+class TargetPolicyKeypointsPosBObs(BaseObs):
+    def __init__(self, policy):
+        self.policy = policy
+        self.future_steps = _policy_future_steps(policy)
+        self._fk = PolicyKeypointPinFK(policy)
+        self.keypoint_names = tuple(self._fk.keypoint_names)
 
     @property
     def size(self):
-        return 3
+        return len(self.future_steps) * len(self.keypoint_names) * 3
 
-    def compute(self):
-        g = self.ctrl.gyro
-        return g
+    def reset(self):
+        pass
 
-class ProjectedGravityB(BaseObs):
-    def __init__(self, ctrl):
+    def update(self):
+        pass
+
+    def compute(self) -> np.ndarray:
+        if (
+            self.policy.ref_joint_pos is None
+            or self.policy.ref_root_quat is None
+            or self.policy.ref_root_pos is None
+        ):
+            raise ValueError("Ref data not available yet.")
+
+        base = self.policy.ref_idx
+        T = self.policy.ref_len
+        fut_idx = _clamp_indices(base + self.future_steps, T)
+
+        root_pos_w = self.policy.ref_root_pos[fut_idx]
+        root_quat_wxyz = self.policy.ref_root_quat[fut_idx]
+        joint_pos = self.policy.ref_joint_pos[fut_idx]
+
+        target_keypoints_w = self._fk.compute_keypoints_world(
+            root_pos_w=root_pos_w,
+            root_quat_wxyz=root_quat_wxyz,
+            joint_pos=joint_pos,
+        )  # [S, K, 3]
+        target_rel_w = target_keypoints_w - root_pos_w[0:1, None, :]
+        S, K, _ = target_rel_w.shape
+        target_keypoints_b = _quat_apply_inv(root_quat_wxyz[0], target_rel_w.reshape(S * K, 3)).reshape(S, K, 3)
+        return target_keypoints_b.reshape(-1).astype(np.float32)
+
+class RootAngVelBHistory(BaseObs):
+    def __init__(self, ctrl, policy):
         self.ctrl = ctrl
+        self.history_steps = list(_require_cfg(policy, "root_angvel_history_steps"))
+        self.max_step = max(self.history_steps)
+        self.hist = np.zeros((self.max_step + 1, 3), dtype=np.float32)
 
     @property
-    def size(self): return 3
+    def size(self):
+        return len(self.history_steps) * 3
+
+    def reset(self):
+        self.hist[:] = self.ctrl.gyro.copy().reshape(1, 3)
+
+    def update(self):
+        self.hist = np.roll(self.hist, 1, axis=0)
+        self.hist[0] = self.ctrl.gyro.copy()
 
     def compute(self):
-        quat = self.ctrl.quat
+        return self.hist[self.history_steps].reshape(-1)
+
+class RootLinAccBHistory(BaseObs):
+    def __init__(self, ctrl, policy):
+        self.ctrl = ctrl
+        self.history_steps = list(_require_cfg(policy, "root_linacc_history_steps"))
+        self.max_step = max(self.history_steps)
+        self.hist = np.zeros((self.max_step + 1, 3), dtype=np.float32)
+
+    @property
+    def size(self):
+        return len(self.history_steps) * 3
+
+    def reset(self):
+        self.hist[:] = self.ctrl.linacc.copy().reshape(1, 3)
+
+    def update(self):
+        self.hist = np.roll(self.hist, 1, axis=0)
+        self.hist[0] = self.ctrl.linacc.copy()
+
+    def compute(self):
+        return self.hist[self.history_steps].reshape(-1)
+
+class ProjectedGravityBHistory(BaseObs):
+    def __init__(self, ctrl, policy):
+        self.ctrl = ctrl
+        self.history_steps = list(_require_cfg(policy, "projected_gravity_history_steps"))
+        self.max_step = max(self.history_steps)
+        self.hist = np.zeros((self.max_step + 1, 3), dtype=np.float32)
+
+    @property
+    def size(self):
+        return len(self.history_steps) * 3
+
+    def reset(self):
         g_world = np.array([0., 0., -1.], dtype=np.float32)
-        g_body = _quat_apply_inv(quat, g_world)
+        g_body = _quat_apply_inv(self.ctrl.quat, g_world)
         g_body /= np.linalg.norm(g_body) + 1e-8
-        return g_body
+        self.hist[:] = g_body.reshape(1, 3)
+
+    def update(self):
+        self.hist = np.roll(self.hist, 1, axis=0)
+        g_world = np.array([0., 0., -1.], dtype=np.float32)
+        g_body = _quat_apply_inv(self.ctrl.quat, g_world)
+        g_body /= np.linalg.norm(g_body) + 1e-8
+        self.hist[0] = g_body
+
+    def compute(self):
+        return self.hist[self.history_steps].reshape(-1)
+
 
 class JointPos(BaseObs):
-    def __init__(self, ctrl,
-                 pos_steps=(0, 1, 2, 4, 8, 16)):
+    def __init__(self, ctrl, policy):
         self.ctrl = ctrl
-        self.pos_steps = list(pos_steps)
+        self.pos_steps = list(_require_cfg(policy, "joint_pos_history_steps"))
         
         self.num_joints = len(ctrl.config.isaac_joint_names_state)
         self.max_step = max(self.pos_steps)
@@ -202,6 +304,33 @@ class JointPos(BaseObs):
     def compute(self):
         pos = self.hist[self.pos_steps].reshape(-1)
         return pos
+
+
+class JointVel(BaseObs):
+    def __init__(self, ctrl, policy):
+        self.ctrl = ctrl
+        self.vel_steps = list(_require_cfg(policy, "joint_vel_history_steps"))
+
+        self.num_joints = len(ctrl.config.isaac_joint_names_state)
+        self.max_step = max(self.vel_steps)
+        self.hist = np.zeros((self.max_step + 1, self.num_joints), dtype=np.float32)
+
+    @property
+    def size(self):
+        return len(self.vel_steps) * self.num_joints
+
+    def reset(self):
+        self.hist[:] = self.ctrl.dqj_isaac.copy().reshape(1, -1)
+
+    def update(self):
+        self.hist = np.roll(self.hist, 1, axis=0)
+        cur = self.ctrl.dqj_isaac.copy()
+        self.hist[0] = cur
+
+    def compute(self):
+        vel = self.hist[self.vel_steps].reshape(-1)
+        return vel
+
 
 class JointTorque(BaseObs):
     def __init__(self, ctrl):
@@ -224,11 +353,11 @@ class JointTorque(BaseObs):
 
 from policy import Policy
 class PrevActions(BaseObs):
-    def __init__(self, policy: Policy, steps=1, old_style=False):
+    def __init__(self, policy: Policy, old_style=False):
         self.policy = policy
-        self.steps = steps
+        self.steps = int(_require_cfg(policy, "prev_action_steps"))
         self.action_dim = self.policy.last_action.shape[0]
-        self.buf = np.zeros((steps, self.action_dim), dtype=np.float32)
+        self.buf = np.zeros((self.steps, self.action_dim), dtype=np.float32)
         self.old_style = old_style
 
     @property
@@ -263,9 +392,9 @@ class BootIndicator(BaseObs):
 class ComplianceFlagObs(BaseObs):
     def __init__(self, policy):
         self.policy = policy
-        self.force_threshold = getattr(self.policy, "compliance_flag_threshold", 0.0)
+        self.force_threshold = float(_require_cfg(policy, "compliance_flag_threshold"))
         self.kp = self.force_threshold / 0.05
-        self.v = float(getattr(self.policy, "compliance_flag_value", 0.0))
+        self.v = float(_require_cfg(policy, "compliance_flag_value"))
 
     @property
     def size(self):

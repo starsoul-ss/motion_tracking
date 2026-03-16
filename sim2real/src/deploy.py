@@ -6,7 +6,6 @@ from multiprocessing import Process, Value
 from typing import Dict, Optional
 
 import numpy as np
-import threading
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_
@@ -47,21 +46,14 @@ class Controller:
         m_info = self.isaac_to_real_mapper_state.get_mapping_info()
         print(f"[Controller] State mapping: {m_info['mapped_joints']}/{m_info['from_space_size']} mapped")
 
-        self._state_lock = threading.Lock()
         self.dof_size_real = len(self.config.real_joint_names)
-
-        self.smoothing_alpha = getattr(self.config, "lowstate_alpha", 0.2)
-        self._qj_smooth   = np.zeros(self.dof_size_real, dtype=np.float32)
-        self._dqj_smooth  = np.zeros(self.dof_size_real, dtype=np.float32)
-        self._tau_smooth  = np.zeros(self.dof_size_real, dtype=np.float32)
-        self._quat_smooth = np.zeros(4, dtype=np.float32)
-        self._gyro_smooth = np.zeros(3, dtype=np.float32)
 
         self.qj_real = np.zeros(self.dof_size_real, dtype=np.float32)
         self.dqj_real = np.zeros(self.dof_size_real, dtype=np.float32)
         self.tau_real = np.zeros(self.dof_size_real, dtype=np.float32)
         self.quat = np.zeros(4, dtype=np.float32)
         self.gyro = np.zeros(3, dtype=np.float32)
+        self.linacc = np.zeros(3, dtype=np.float32)
 
         self.qj_isaac = None
         self.dqj_isaac = None
@@ -71,12 +63,7 @@ class Controller:
         self.init_qpos_real    = np.array(self.config.init_qpos_real, dtype=np.float32)
         self.kps_real          = np.array(self.config.kps_real, dtype=np.float32)
         self.kds_real          = np.array(self.config.kds_real, dtype=np.float32)
-        self.motor_limits_low_real  = np.array(self.config.motor_limits_low_real, dtype=np.float32)
-        self.motor_limits_high_real = np.array(self.config.motor_limits_high_real, dtype=np.float32)
         self.dof_size_real = len(self.default_qpos_real)
-
-        self.joint_slew_rate = float(getattr(self.config, "joint_slew_rate", 1.0))  # rad/s
-        self._last_target_qpos_real = self.init_qpos_real.copy()
 
         self.counter = 0
         self.policy_step = 0
@@ -91,7 +78,7 @@ class Controller:
         self.lowcmd_publisher_.Init()
 
         self.lowstate_subscriber = ChannelSubscriber(self.config.lowstate_topic, LowStateHG)
-        self.lowstate_subscriber.Init(self.LowStateHgHandler, 0)
+        self.lowstate_subscriber.Init()
 
         self.loop_count = Value('i', 0)
         self.p_loop_rate = Process(target=self.count_loop_rate, args=(self.loop_count,), daemon=True)
@@ -117,27 +104,25 @@ class Controller:
             loop_count.value = 0
             count_loop_timer.sleep()
 
-    def LowStateHgHandler(self, msg: LowStateHG):
-        a = self.smoothing_alpha
-        with self._state_lock:
-            self.low_state = msg
+    def _consume_low_state(self, msg: LowStateHG) -> bool:
+        if msg is None or not hasattr(msg, "motor_state"):
+            return False
 
-            q = [msg.motor_state[i].q for i in range(self.dof_size_real)]
-            dq = [msg.motor_state[i].dq for i in range(self.dof_size_real)]
-            tau = [msg.motor_state[i].tau_est for i in range(self.dof_size_real)]
+        self.low_state = msg
+        self.qj_real[:] = np.array([msg.motor_state[i].q for i in range(self.dof_size_real)], dtype=np.float32)
+        self.dqj_real[:] = np.array([msg.motor_state[i].dq for i in range(self.dof_size_real)], dtype=np.float32)
+        self.tau_real[:] = np.array([msg.motor_state[i].tau_est for i in range(self.dof_size_real)], dtype=np.float32)
+        self.quat[:] = np.array(msg.imu_state.quaternion, dtype=np.float32)
+        self.gyro[:] = np.array(msg.imu_state.gyroscope, dtype=np.float32)
+        self.linacc[:] = np.array(msg.imu_state.accelerometer, dtype=np.float32)
 
-            self._qj_smooth[:]   = (1 - a) * self._qj_smooth[:]  + a * np.array(q, dtype=np.float32)
-            self._dqj_smooth[:]  = (1 - a) * self._dqj_smooth[:] + a * np.array(dq, dtype=np.float32)
-            self._tau_smooth[:]  = (1 - a) * self._tau_smooth[:] + a * np.array(tau, dtype=np.float32)
-            self._quat_smooth[:] = (1 - a) * self._quat_smooth   + a * np.array(msg.imu_state.quaternion, dtype=np.float32)
-            self._gyro_smooth[:] = (1 - a) * self._gyro_smooth    + a * np.array(msg.imu_state.gyroscope,  dtype=np.float32)
+        if self.args.sim2sim:
+            self.remote_controller.set_sim2sim(msg.wireless_remote)
+        elif self.args.real:
+            self.remote_controller.set(msg.wireless_remote)
 
-            if self.args.sim2sim:
-                self.remote_controller.set_sim2sim(msg.wireless_remote)
-            elif self.args.real:
-                self.remote_controller.set(msg.wireless_remote)
-
-            self.mode_machine_ = msg.mode_machine
+        self.mode_machine_ = msg.mode_machine
+        return True
 
     def send_cmd(self, cmd):
         cmd.crc = CRC().Crc(cmd)
@@ -145,13 +130,15 @@ class Controller:
 
     def wait_for_low_state(self):
         while self.low_state.tick == 0:
-            time.sleep(self.control_dt)
+            msg = self.lowstate_subscriber.Read()
+            self._consume_low_state(msg)
         print("Successfully connected to the robot.")
 
     def zero_torque_state(self):
         print("Enter zero torque state.")
         print("Waiting for the start signal...")
         while self.remote_controller.button[KeyMap.start] != 1:
+            self.process_state()
             create_zero_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
             time.sleep(self.control_dt)
@@ -176,7 +163,6 @@ class Controller:
                 self.low_cmd.motor_cmd[i].tau = 0
             self.send_cmd(self.low_cmd)
             time.sleep(self.control_dt)
-        self._last_target_qpos_real[:] = self.init_qpos_real[:]
 
     def default_qpos_state(self):
         initial_policy: Optional[Policy] = None
@@ -204,7 +190,6 @@ class Controller:
                 break
 
         self.current_policy = initial_policy
-        self.smoothing_alpha = self.current_policy.lowstate_alpha
         if hasattr(self.current_policy, "kps_real") and hasattr(self.current_policy, "kds_real"):
             self.kps_real[:] = self.current_policy.kps_real
             self.kds_real[:] = self.current_policy.kds_real
@@ -214,22 +199,18 @@ class Controller:
         self.send_cmd(self.low_cmd)
 
     def process_state(self):
-        with self._state_lock:
-            self.qj_real[:]  = self._qj_smooth
-            self.dqj_real[:] = self._dqj_smooth
-            self.tau_real[:] = self._tau_smooth
-            self.quat[:]     = self._quat_smooth
-            self.gyro[:]     = self._gyro_smooth
+        msg = self.lowstate_subscriber.Read(0.0)
+        self._consume_low_state(msg)
 
-            now = np.array(self.remote_controller.button, dtype=np.int8)
-            if self._prev_buttons is None or len(self._prev_buttons) != len(now):
-                self._prev_buttons = now.copy()
-                self.btn_rise = np.zeros_like(now, dtype=bool)
-                self.btn_fall = np.zeros_like(now, dtype=bool)
-            else:
-                self.btn_rise = (self._prev_buttons == 0) & (now == 1)
-                self.btn_fall = (self._prev_buttons == 1) & (now == 0)
-                self._prev_buttons = now
+        now = np.array(self.remote_controller.button, dtype=np.int8)
+        if self._prev_buttons is None or len(self._prev_buttons) != len(now):
+            self._prev_buttons = now.copy()
+            self.btn_rise = np.zeros_like(now, dtype=bool)
+            self.btn_fall = np.zeros_like(now, dtype=bool)
+        else:
+            self.btn_rise = (self._prev_buttons == 0) & (now == 1)
+            self.btn_fall = (self._prev_buttons == 1) & (now == 0)
+            self._prev_buttons = now
 
         self.qj_isaac = self.isaac_to_real_mapper_state.map_state_to_from(self.qj_real)
         self.dqj_isaac = self.isaac_to_real_mapper_state.map_state_to_from(self.dqj_real)
@@ -266,6 +247,7 @@ class Controller:
                 self.current_policy.update_obs()
                 action_real = self.current_policy.compute_action()
                 self._apply_action_real(action_real)
+                self.current_policy.post_step()
 
                 self.send_cmd(self.low_cmd)
                 loop_count.value += 1

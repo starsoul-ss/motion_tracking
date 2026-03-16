@@ -129,48 +129,48 @@ G1_ACTUATOR_UPPER = BuiltinPositionActuatorCfg(
     damping=0.907222843292423,
     effort_limit=25.0,
 )
-G1_ACTUATOR_HIP_YAW_PITCH = BuiltinPositionActuatorCfg(
-    target_names_expr=(".*_hip_pitch_joint", ".*_hip_yaw_joint", "waist_yaw_joint"),
+G1_ACTUATOR_HIP_YAW_WAIST_YAW = BuiltinPositionActuatorCfg(
+    target_names_expr=(".*_hip_yaw_joint", "waist_yaw_joint"),
     armature=0.010177520,
     stiffness=40.17923847137318,
     damping=2.5578897650279457,
     effort_limit=88.0,
 )
-G1_ACTUATOR_HIP_ROLL_KNEE = BuiltinPositionActuatorCfg(
-    target_names_expr=(".*_hip_roll_joint", ".*_knee_joint"),
+G1_ACTUATOR_HIP_PITCH_ROLL_KNEE = BuiltinPositionActuatorCfg(
+    target_names_expr=(".*_hip_pitch_joint", ".*_hip_roll_joint", ".*_knee_joint"),
     armature=0.025101925,
     stiffness=99.09842777666113,
     damping=6.3088018534966395,
     effort_limit=139.0,
 )
-G1_ACTUATOR_WRIST_FINE = BuiltinPositionActuatorCfg(
+G1_ACTUATOR_WRIST_PITCH_YAW = BuiltinPositionActuatorCfg(
     target_names_expr=(".*_wrist_pitch_joint", ".*_wrist_yaw_joint"),
-    armature=0.00425,
-    stiffness=16.77832748089279,
-    damping=1.06814150219,
-    effort_limit=5.0,
+    armature=0.0021812,
+    stiffness=8.611032447370201,
+    damping=0.548195351665136,
+    effort_limit=13.4,
 )
 G1_ACTUATOR_WAIST = BuiltinPositionActuatorCfg(
     target_names_expr=("waist_pitch_joint", "waist_roll_joint"),
     armature=0.00721945,
     stiffness=28.50124619574858,
     damping=1.814445686584846,
-    effort_limit=50.0,
+    effort_limit=35.0,
 )
 G1_ACTUATOR_ANKLE = BuiltinPositionActuatorCfg(
     target_names_expr=(".*_ankle_pitch_joint", ".*_ankle_roll_joint"),
     armature=0.00721945,
     stiffness=28.50124619574858,
     damping=1.814445686584846,
-    effort_limit=50.0,
+    effort_limit=35.0,
 )
 
 G1_ARTICULATION = EntityArticulationInfoCfg(
     actuators=(
         G1_ACTUATOR_UPPER,
-        G1_ACTUATOR_HIP_YAW_PITCH,
-        G1_ACTUATOR_HIP_ROLL_KNEE,
-        G1_ACTUATOR_WRIST_FINE,
+        G1_ACTUATOR_HIP_PITCH_ROLL_KNEE,
+        G1_ACTUATOR_HIP_YAW_WAIST_YAW,
+        G1_ACTUATOR_WRIST_PITCH_YAW,
         G1_ACTUATOR_WAIST,
         G1_ACTUATOR_ANKLE,
     ),

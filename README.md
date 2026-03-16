@@ -1,20 +1,20 @@
 # Whole Body Motion Tracking
 
-This repository is an extension of the [GentleHumanoid](https://gentle-humanoid.axell.top) training repository, supporting universal, robust, and highly dynamic whole-body motion tracking policy training with upper-body compliance.
+This repository contains the training, evaluation, and deployment assets for a whole-body motion tracking policy built on top of the [GentleHumanoid](https://gentle-humanoid.axell.top) codebase.
 
-Main features:
+The main focus of this repository is:
 
-*  A **universal** whole-body motion tracking policy, training and evaluation pipeline.
+* training a **universal**, **robust**, and **highly dynamic** whole-body motion tracking policy,
+* supporting upper-body **compliance-aware** behavior for contact-rich interaction,
+* supporting robust live **VR teleoperation** through a separate teleop stack.
 
-* Upper-body **compliance-aware** control for contact-rich interaction.
+The simulation and training backend is based on **mjlab**.
 
-* Simulation backend based on **mjlab**.
-
-A **demo** of the pretrained policies, shows a single model generalizing across diverse and highly dynamic motions, is available [here](https://motion-tracking.axell.top).
+A demo of the pretrained policy, showing one model generalizing across diverse and highly dynamic motions, is available [here](https://motion-tracking.axell.top).
 
 https://github.com/user-attachments/assets/4d210dbf-8023-4270-b094-ab6a2353deda
 
-Instructions for **real-robot deployment** and the use of **pretrained models** on new motion sequences are available in `sim2real` folder.
+Instructions for deployment and runtime usage are available in the [`sim2real`](./sim2real) folder.
 
 ## Installation
 
@@ -103,3 +103,16 @@ Such adjustments may increase training time and could affect training performanc
 uv run scripts/eval.py --run_path ${wandb_run_path} -p # p for play
 uv run scripts/eval.py --run_path ${wandb_run_path} -p --export # export the policy to onnx (sim2real)
 ```
+
+If you export a deployment policy, the exported checkpoint will be written under `scripts/exports/<task-name>-<timestamp>/`.
+
+To use it in the deployment runtime:
+
+1. Copy the exported policy folder (including `policy.onnx`, `policy.pt`, and `policy.json`) into `sim2real/assets/ckpts/`.
+2. Update `sim2real/config/tracking.yaml` so that `policy_path` points to the new ONNX file.
+
+For the actual deployment-side test procedure:
+
+- see [`sim2real/README.md`](./sim2real/README.md) for `sim2sim/sim2real` testing
+
+That README also explains how to use the UDP motion selector and the VR motion source during deployment.

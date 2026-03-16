@@ -1,5 +1,4 @@
 import torch
-import wandb
 import os
 import sys
 import hydra
@@ -11,8 +10,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from omegaconf import OmegaConf
 from scripts.utils.play import play
 from scripts.utils.eval import eval
+from active_adaptation.utils.wandb import (
+    load_run_cfg_and_checkpoint,
+    load_wandb_cfg_from_yaml,
+)
 
 FILE_PATH = os.path.dirname(__file__)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -30,51 +34,19 @@ def main():
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     args = parser.parse_args()
 
-    api = wandb.Api()
-    
-    run = api.run(args.run_path)
-    print(f"Loading run {run.name}")
+    wandb_cfg = load_wandb_cfg_from_yaml(os.path.join(FILE_PATH, "..", "cfg", "eval.yaml"))
+    cfg, download = load_run_cfg_and_checkpoint(
+        args.run_path,
+        wandb_cfg=wandb_cfg,
+        root_dir=os.path.join(os.path.dirname(__file__), "wandb"),
+        iteration=args.iterations,
+    )
 
-    root = os.path.join(os.path.dirname(__file__), "wandb", run.name)
-    os.makedirs(root, exist_ok=True)
-
-    checkpoints = []
-    for file in run.files():
-        print(file.name)
-        if "checkpoint" in file.name:
-            checkpoints.append(file)
-        elif file.name == "cfg.yaml":
-            file.download(root, replace=True)
-        elif file.name == "files/cfg.yaml":
-            file.download(root, replace=True)
-        elif file.name == "config.yaml":
-            file.download(root, replace=True)
-    
-    if args.iterations is None:
-        def sort_by_time(file):
-            number_str = file.name[:-3].split("_")[-1]
-            if number_str == "final":
-                return 100000
-            else:
-                return int(number_str)
-
-        checkpoints.sort(key=sort_by_time)
-        checkpoint = checkpoints[-1]
-    else:
-        for file in checkpoints:
-            if file.name == f"checkpoint_{args.iterations}.pt":
-                checkpoint = file
-                break
-    print(f"Downloading {checkpoint.name}")
-    checkpoint.download(root, replace=True)
-
-    try:
-        cfg = OmegaConf.load(os.path.join(root, "files", "cfg.yaml"))
-    except FileNotFoundError:
-        cfg = OmegaConf.load(os.path.join(root, "cfg.yaml"))
+    print(f"Loading run {download.run_name}")
+    print(f"Downloading {download.checkpoint_name}")
     OmegaConf.set_struct(cfg, False)
 
-    cfg["checkpoint_path"] = os.path.join(root, checkpoint.name)
+    cfg["checkpoint_path"] = download.checkpoint_path
     cfg["vecnorm"] = "eval"
 
     if args.teleop:

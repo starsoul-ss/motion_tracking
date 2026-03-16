@@ -3,7 +3,6 @@ import torch.nn as nn
 import hydra
 import numpy as np
 import time
-import wandb
 import logging
 import os
 import datetime
@@ -166,7 +165,7 @@ def make_env_policy(cfg: DictConfig):
     aa.print("SimpleEnv done")
 
     if cfg.checkpoint_path is not None and aa.is_main_process():
-        checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
+        checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path, cfg.get("wandb", None))
         aa.print(f"Loading checkpoint from {checkpoint_path}")
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:

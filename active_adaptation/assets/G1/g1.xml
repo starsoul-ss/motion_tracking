@@ -43,17 +43,17 @@
     <mesh name="left_shoulder_roll_link" file="left_shoulder_roll_link.STL"/>
     <mesh name="left_shoulder_yaw_link" file="left_shoulder_yaw_link.STL"/>
     <mesh name="left_elbow_link" file="left_elbow_link.STL"/>
-    <mesh name="left_wrist_roll_link" file="left_wrist_roll_link.STL"/>
-    <mesh name="left_wrist_pitch_link" file="left_wrist_pitch_link.STL"/>
-    <mesh name="left_wrist_yaw_link" file="left_wrist_yaw_link.STL"/>
+    <mesh name="left_wrist_roll_link" file="left_wrist_roll_link_5010.STL"/>
+    <mesh name="left_wrist_pitch_link" file="left_wrist_pitch_link_5010.STL"/>
+    <mesh name="left_wrist_yaw_link" file="left_wrist_yaw_link_5010.STL"/>
     <mesh name="left_rubber_hand" file="left_rubber_hand.STL"/>
     <mesh name="right_shoulder_pitch_link" file="right_shoulder_pitch_link.STL"/>
     <mesh name="right_shoulder_roll_link" file="right_shoulder_roll_link.STL"/>
     <mesh name="right_shoulder_yaw_link" file="right_shoulder_yaw_link.STL"/>
     <mesh name="right_elbow_link" file="right_elbow_link.STL"/>
-    <mesh name="right_wrist_roll_link" file="right_wrist_roll_link.STL"/>
-    <mesh name="right_wrist_pitch_link" file="right_wrist_pitch_link.STL"/>
-    <mesh name="right_wrist_yaw_link" file="right_wrist_yaw_link.STL"/>
+    <mesh name="right_wrist_roll_link" file="right_wrist_roll_link_5010.STL"/>
+    <mesh name="right_wrist_pitch_link" file="right_wrist_pitch_link_5010.STL"/>
+    <mesh name="right_wrist_yaw_link" file="right_wrist_yaw_link_5010.STL"/>
     <mesh name="right_rubber_hand" file="right_rubber_hand.STL"/>
   </asset>
 
@@ -228,12 +228,12 @@
                       <joint name="left_wrist_roll_joint" axis="1 0 0" range="-1.97222 1.97222"/>
                       <geom class="visual" mesh="left_wrist_roll_link"/>
                       <body name="left_wrist_pitch_link" pos="0.038 0 0">
-                        <inertial pos="0.0229999 -0.00111685 -0.00111658" quat="0.249998 0.661363 0.293036 0.643608"
-                          mass="0.48405" diaginertia="0.000430353 0.000429873 0.000164648"/>
+                        <inertial pos="0.0254915 -0.000540425 -0.000541439" quat="0.48716 0.502863 0.487661 0.521527"
+                          mass="0.684" diaginertia="0.000716495 0.000716079 0.000255669"/>
                         <joint name="left_wrist_pitch_joint" axis="0 1 0" range="-1.61443 1.61443"/>
                         <geom class="visual" mesh="left_wrist_pitch_link"/>
                         <geom name="left_wrist_collision" class="collision" size="0.035" fromto="-0.01 0 0 0.06 0 0"/>
-                        <body name="left_wrist_yaw_link" pos="0.046 0 0">
+                        <body name="left_wrist_yaw_link" pos="0.051 0 0">
                           <inertial pos="0.0708244 0.000191745 0.00161742" quat="0.510571 0.526295 0.468078 0.493188"
                             mass="0.254576" diaginertia="0.000646113 0.000559993 0.000147566"/>
                           <joint name="left_wrist_yaw_joint" axis="0 0 1" range="-1.61443 1.61443"/>
@@ -280,12 +280,12 @@
                       <joint name="right_wrist_roll_joint" axis="1 0 0" range="-1.97222 1.97222"/>
                       <geom class="visual" mesh="right_wrist_roll_link"/>
                       <body name="right_wrist_pitch_link" pos="0.038 0 0">
-                        <inertial pos="0.0229999 0.00111685 -0.00111658" quat="0.643608 0.293036 0.661363 0.249998"
-                          mass="0.48405" diaginertia="0.000430353 0.000429873 0.000164648"/>
+                        <inertial pos="0.0254915 0.000540425 -0.000541439" quat="0.487661 0.521527 0.48716 0.502863"
+                          mass="0.684" diaginertia="0.000716495 0.000716079 0.000255669"/>
                         <joint name="right_wrist_pitch_joint" axis="0 1 0" range="-1.61443 1.61443"/>
                         <geom class="visual" mesh="right_wrist_pitch_link"/>
                         <geom name="right_wrist_collision" class="collision" size="0.035" fromto="-0.01 0 0 0.06 0 0"/>
-                        <body name="right_wrist_yaw_link" pos="0.046 0 0">
+                        <body name="right_wrist_yaw_link" pos="0.051 0 0">
                           <inertial pos="0.0708244 -0.000191745 0.00161742" quat="0.493188 0.468078 0.526295 0.510571"
                             mass="0.254576" diaginertia="0.000646113 0.000559993 0.000147566"/>
                           <joint name="right_wrist_yaw_joint" axis="0 0 1" range="-1.61443 1.61443"/>

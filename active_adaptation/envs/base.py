@@ -214,7 +214,7 @@ class _Env(EnvBase):
             done=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
             terminated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
             truncated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
-            shape=[self.num_envs, 1],
+            shape=[self.num_envs],
             device=self.device
         )
 
@@ -497,12 +497,12 @@ class _Env(EnvBase):
     def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
         ## update simulation
         self._update_sim(tensordict)
+        self.sim.forward()
+        self.sim.sense()
 
         ## do command update before reward computation
         self.command_manager.before_update()
 
-        self.discount.fill_(1.0)
-        
         self._update()
         
         tensordict = TensorDict({}, self.num_envs, device=self.device)
@@ -525,6 +525,7 @@ class _Env(EnvBase):
         tensordict.set("terminated", terminated)
         tensordict.set("truncated", truncated)
         tensordict.set("done", terminated | truncated)
+        self.discount.fill_(1.0)
         tensordict.set("discount", self.discount.clone())
         tensordict["stats"] = self.stats.clone()
 
@@ -578,6 +579,7 @@ class _Env(EnvBase):
             )
             self._viser_scene.create_visualization_gui()
             self._viser_scene.debug_visualization_enabled = True
+            self._viser_scene.camera_tracking_enabled = False
             self._viewer_enabled = True
             self.debug_draw = _ViserDebugDraw(self._viser_scene)
             print("[INFO] Viser viewer launched.")

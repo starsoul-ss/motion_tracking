@@ -29,6 +29,9 @@ wandb:
   run_id: 
   monitor_gym: True
   tags: 
+  settings:
+    http_proxy: null
+    https_proxy: null
 
 
 defaults:

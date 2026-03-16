@@ -15,7 +15,9 @@ class SimpleEnv(_Env):
             )
 
         from mjlab.scene import SceneCfg as MJSceneCfg
-        from mjlab.terrains.terrain_importer import TerrainImporterCfg
+        from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
+        from mjlab.terrains import TerrainEntityCfg
+        import mjlab.terrains as terrain_gen
         from mjlab.sensor import ContactMatch, ContactSensorCfg
         from mjlab.sim import MujocoCfg, SimulationCfg
         from mjlab.scene import Scene
@@ -24,7 +26,7 @@ class SimpleEnv(_Env):
         env_spacing = self.cfg.viewer.get("env_spacing", 2.5)
         scene_cfg = MJSceneCfg(num_envs=self.cfg.num_envs, env_spacing=env_spacing)
 
-        scene_cfg.terrain = TerrainImporterCfg(
+        scene_cfg.terrain = TerrainEntityCfg(
             terrain_type="plane",
             env_spacing=env_spacing,
             num_envs=self.cfg.num_envs,
@@ -69,8 +71,8 @@ class SimpleEnv(_Env):
             mjlab_dt = self.cfg.sim.get("mujoco_physics_dt", None)
 
         self.sim_cfg = sim_cfg = SimulationCfg(
-            nconmax=35,
-            njmax=300,
+            nconmax=200,
+            njmax=500,
             mujoco=MujocoCfg(
                 timestep=mjlab_dt,
                 iterations=10,

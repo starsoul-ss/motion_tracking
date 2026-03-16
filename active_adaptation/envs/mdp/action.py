@@ -86,7 +86,7 @@ class JointPosition(ActionManager):
             # Max delay index used below is ceil(max_delay / decimation), so
             # history length must be at least that index + 1.
             max_hist_idx = (self.max_delay + self.env.decimation - 1) // self.env.decimation
-            hist = max(max_hist_idx + 1, 3)
+            hist = max(max_hist_idx + 1, 8)
             self.action_buf = torch.zeros(self.num_envs, hist, self.action_dim)
             self.applied_action = torch.zeros(self.num_envs, self.action_dim)
             self.alpha = torch.ones(self.num_envs, 1)

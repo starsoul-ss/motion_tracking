@@ -35,6 +35,9 @@ wandb:
   tags: []
   id: null
   notes: null
+  settings:
+    http_proxy: null
+    https_proxy: null
 
 defaults:
   - task: G1/G1_gentle

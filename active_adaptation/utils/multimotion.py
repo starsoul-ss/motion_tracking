@@ -76,10 +76,10 @@ class ProgressiveMultiMotionDataset:
             idx = starts.unsqueeze(1) + steps.to(device=self.device, dtype=torch.long)
 
         if env_ids is not None:
-            idx = idx.clamp(max=(self._len_A[env_ids] - 1).unsqueeze(1))
+            idx.clamp_min_(0).clamp_max_((self._len_A[env_ids] - 1).unsqueeze(1))
             sub = self._buf_A[env_ids.unsqueeze(-1), idx]
         else:
-            idx = idx.clamp(max=(self._len_A[:] - 1).unsqueeze(1))
+            idx.clamp_min_(0).clamp_max_((self._len_A[:] - 1).unsqueeze(1))
             sub = self._buf_A.gather(1, idx)
         sub = self._to_float(sub, dtype=torch.float32)
         return self._post_process(sub)
@@ -108,12 +108,12 @@ class ProgressiveMultiMotionDataset:
             idx = starts.unsqueeze(1) + steps.to(device=self.device, dtype=torch.long)
 
         if env_ids is not None:
-            idx = idx.clamp(max=(self._len_A[env_ids] - 1).unsqueeze(1))
+            idx.clamp_min_(0).clamp_max_((self._len_A[env_ids] - 1).unsqueeze(1))
             joint_pos = original_joint_pos[env_ids.unsqueeze(-1), idx]
             joint_vel = original_joint_vel[env_ids.unsqueeze(-1), idx]
             body_pos_w = original_body_pos_w[env_ids.unsqueeze(-1), idx]
         else:
-            idx = idx.clamp(max=(self._len_A[:] - 1).unsqueeze(1))
+            idx.clamp_min_(0).clamp_max_((self._len_A[:] - 1).unsqueeze(1))
             jp_idx = idx.unsqueeze(-1).expand(-1, -1, original_joint_pos.shape[-1])
             jv_idx = idx.unsqueeze(-1).expand(-1, -1, original_joint_vel.shape[-1])
             bp_idx = idx.unsqueeze(-1).unsqueeze(-1).expand(
@@ -156,9 +156,9 @@ class ProgressiveMultiMotionDataset:
             idx = starts.unsqueeze(1) + steps.to(device=self.device, dtype=torch.long)
 
         if env_ids is not None:
-            idx = idx.clamp(max=(self._len_A[env_ids] - 1).unsqueeze(1))
+            idx.clamp_min_(0).clamp_max_((self._len_A[env_ids] - 1).unsqueeze(1))
             return self._modified_mask_A[env_ids.unsqueeze(-1), idx]
-        idx = idx.clamp(max=(self._len_A[:] - 1).unsqueeze(1))
+        idx.clamp_min_(0).clamp_max_((self._len_A[:] - 1).unsqueeze(1))
         return self._modified_mask_A.gather(1, idx)
 
     def set_limit(self, joint_pos_limit: torch.Tensor, joint_vel_limit: torch.Tensor, joint_names: List[str]):
@@ -279,7 +279,6 @@ class ProgressiveMultiMotionDataset:
         fk_asset: Any,
         fk_base_body_name: str,
         fk_ee_link_names: Sequence[str],
-        backup_body_idx_motion: Sequence[int] | torch.Tensor,
     ):
         self.enable_modify_joint = True
         self.modify_joint_left_prob = 0.7
@@ -294,9 +293,6 @@ class ProgressiveMultiMotionDataset:
         self.modify_fk_asset = fk_asset
         self.modify_fk_base_body_name = str(fk_base_body_name)
         self.modify_fk_ee_link_names = tuple(fk_ee_link_names)
-        self.modify_backup_body_idx_motion = torch.tensor(
-            list(backup_body_idx_motion), device=self.device, dtype=torch.long
-        )
         self.modify_joint_left_ids = None
         self.modify_joint_right_ids = None
         self.modify_joint_pos_bank = None
@@ -330,7 +326,7 @@ class ProgressiveMultiMotionDataset:
 
         self.original_joint_pos = self._buf_A.joint_pos.clone()
         self.original_joint_vel = self._buf_A.joint_vel.clone()
-        self.original_body_pos_w = self._buf_A.body_pos_w[:, :, self.modify_backup_body_idx_motion].clone()
+        self.original_body_pos_w = self._buf_A.body_pos_w.clone()
 
     @torch.no_grad()
     def modify_joint(self, env_ids_restore: torch.Tensor, env_ids_modify: torch.Tensor):

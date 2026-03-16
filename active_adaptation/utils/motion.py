@@ -62,7 +62,7 @@ class MotionDataset:
             path_root = os.path.join(project_root, "dataset")
         mem_path = os.path.join(path_root, mem_path)
 
-        data = MotionData.load(mem_path)
+        data = MotionData.load_memmap(os.path.join(mem_path, "_tensordict"))
         data = data.to(device)
         with open(mem_path + "/meta_motion.json", "r") as f:
             meta = json.load(f)
@@ -357,7 +357,7 @@ class MotionDataset:
         # Save to mem_path
         if mem_path is not None:
             path = mem_path
-            data.memmap(path)
+            data.memmap(path + "/_tensordict")
             # Write metadata
             dump_data = {
                 "body_names": meta['body_names'],
@@ -385,14 +385,15 @@ class MotionDataset:
     def get_slice(self, motion_ids: torch.Tensor, starts: torch.Tensor, steps: int = 1) -> MotionData:
         motion_ids = motion_ids.to(dtype=torch.long, device=self.starts.device)
         starts = starts.to(dtype=torch.long, device=self.starts.device)
+        starts_per_motion = self.starts[motion_ids].to(torch.long).unsqueeze(1)
         if isinstance(steps, int):
-            idx = (self.starts[motion_ids].to(torch.long) + starts).unsqueeze(1) + torch.arange(
+            idx = (starts_per_motion.squeeze(1) + starts).unsqueeze(1) + torch.arange(
                 steps, device=self.starts.device, dtype=torch.long
             )
         else:
-            idx = (self.starts[motion_ids].to(torch.long) + starts).unsqueeze(1) + steps.to(
+            idx = (starts_per_motion.squeeze(1) + starts).unsqueeze(1) + steps.to(
                 dtype=torch.long, device=self.starts.device
             )
         ends_per_motion = (self.ends[motion_ids].to(torch.long) - 1).unsqueeze(1)
-        idx = idx.clamp(max=ends_per_motion)
+        idx.clamp_min_(starts_per_motion).clamp_max_(ends_per_motion)
         return self.data[idx]

@@ -1,6 +1,7 @@
 import torch
 from typing import Optional
 import math
+from active_adaptation.utils.math import quat_from_angle_axis, quat_mul
 
 class TemporalLerp:
     """
@@ -169,13 +170,35 @@ def rand_points_disk(
     dtype=torch.float32,
     generator: torch.Generator | None = None,
 ):
-    u = torch.rand((N, M, 1), device=device, dtype=dtype, generator=generator)
-    r = torch.sqrt(u) * r_max
+    u = torch.rand((N, M, 1), device=device, dtype=dtype, generator=generator) * r_max
+    direction = torch.randn((N, M, 2), device=device, dtype=dtype, generator=generator)
+    direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return direction * u
 
-    phi = 2 * math.pi * torch.rand((N, M, 1), device=device, dtype=dtype, generator=generator)
 
-    x = r * torch.cos(phi)
-    y = r * torch.sin(phi)
+def _rand_unit_vectors(shape: tuple[int, ...], *, device=None, dtype=torch.float32):
+    vec = torch.randn(shape, device=device, dtype=dtype)
+    return vec / vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-    pts = torch.cat([x, y], dim=-1)
-    return pts
+
+def add_spherical_noise(x: torch.Tensor, noise_std: float) -> torch.Tensor:
+    """Add isotropic 3D noise with radius sampled uniformly from [0, noise_std]."""
+    if noise_std <= 0.0:
+        return x
+    if x.shape[-1] != 3:
+        raise ValueError(f"add_spherical_noise expects last dim 3, got shape {tuple(x.shape)}")
+    direction = _rand_unit_vectors(tuple(x.shape), device=x.device, dtype=x.dtype)
+    radius = torch.rand(tuple(x.shape[:-1]) + (1,), device=x.device, dtype=x.dtype) * float(noise_std)
+    return x + direction * radius
+
+
+def perturb_quaternion(quat: torch.Tensor, angle_std: float) -> torch.Tensor:
+    """Left-multiply random axis-angle perturbation with angle sampled uniformly from [-angle_std, angle_std]."""
+    if angle_std <= 0.0:
+        return quat
+    if quat.shape[-1] != 4:
+        raise ValueError(f"perturb_quaternion expects last dim 4, got shape {tuple(quat.shape)}")
+    axis = _rand_unit_vectors(tuple(quat.shape[:-1]) + (3,), device=quat.device, dtype=quat.dtype)
+    angle = (torch.rand(quat.shape[:-1], device=quat.device, dtype=quat.dtype) * 2.0 - 1.0) * float(angle_std)
+    delta = quat_from_angle_axis(angle, axis)
+    return quat_mul(delta, quat)

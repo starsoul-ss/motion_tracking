@@ -11,7 +11,7 @@ import einops
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from torchrl.data import CompositeSpec, TensorSpec
+from torchrl.data import Composite, TensorSpec
 from torchrl.envs.transforms import TensorDictPrimer, ExcludeTransform
 from torchrl.modules import ProbabilisticActor
 from tensordict import TensorDict
@@ -95,8 +95,8 @@ class PPOPolicy(TensorDictModuleBase):
     def __init__(
         self,
         cfg: PPOConfig,
-        observation_spec: CompositeSpec,
-        action_spec: CompositeSpec,
+        observation_spec: Composite,
+        action_spec: Composite,
         reward_spec: TensorSpec,
         device: str = "cuda:0",
         env = None
@@ -195,17 +195,11 @@ class PPOPolicy(TensorDictModuleBase):
 
         # ---------------------------------------------------------------------------- optimisers
         self.opt_teacher = torch.optim.Adam(
-            [
-                {"params": self.actor_teacher.parameters()},
-                {"params": self.encoder_priv.parameters()},
-            ],
+            list(self.actor_teacher.parameters()) + list(self.encoder_priv.parameters()),
             lr=cfg.lr,
         )
         self.opt_student = torch.optim.Adam(
-            [
-                {"params": self.actor_student.parameters()},
-                # {"params": self.adapt_module.parameters()},
-            ],
+            self.actor_student.parameters(),
             lr=cfg.lr,
         )
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
@@ -398,7 +392,7 @@ class PPOPolicy(TensorDictModuleBase):
         bsize = mb.shape[0]
         loc_old, scale_old = mb["loc"].clone(), mb["scale"].clone()
         action_old = mb["action"].clone()
-        logp_old = mb["sample_log_prob"].clone()
+        logp_old = mb["action_log_prob"].clone()
 
         if self.use_symmetry_ppo:
             mb_sym = mb.clone()
@@ -415,7 +409,7 @@ class PPOPolicy(TensorDictModuleBase):
         else:
             mb = mb.exclude("next")
         valid = ~mb["is_init"]
-        mb = mb.exclude("sample_log_prob", "action")
+        mb = mb.exclude("action_log_prob", "action")
 
         if encoder is not None:
             if update_encoder:
