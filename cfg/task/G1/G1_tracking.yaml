@@ -34,7 +34,6 @@ command:
   lower_keypoint_patterns: [".*knee.*", ".*hip_yaw_link", ".*ankle_roll_link"]
   upper_keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link"]
   feet_patterns: ["left_ankle_roll_link", "right_ankle_roll_link"]
-  policy_keypoint_patterns: [".*ankle_roll_link", ".*_hand_mimic"]
   feet_standing_z_enter: 0.18
   feet_standing_z_exit: 0.25
   feet_standing_vxy_enter: 0.2
@@ -83,7 +82,6 @@ observation:
     command_obs: {noise_std: 0.1, horizon: student, target_quat_noise_std: 0.025, target_pos_noise_std: 0.005}
     compliance_flag_obs: {}
     target_joint_pos_obs: {noise_std: 0.015, horizon: student, source: original, target_noise_std: 0.01, use_bias: true}
-    # target_policy_keypoints_pos_b_obs: {horizon: student, source: original, target_noise_std: 0.005, use_bias: true}
     target_root_z_obs: {horizon: student, target_noise_std: 0.01}
     target_projected_gravity_b_obs: {horizon: student, target_noise_std: 0.025}
 

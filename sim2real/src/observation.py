@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from common.fk_utils import PolicyKeypointPinFK
 from common.math_utils import _clamp_indices, _quat_apply_inv
 
 
@@ -166,49 +165,6 @@ class TargetProjectedGravityBObs:
         g_local = _quat_apply_inv(root_quat_w, g_world)
         return g_local.reshape(-1).astype(np.float32)
 
-
-class TargetPolicyKeypointsPosBObs(BaseObs):
-    def __init__(self, policy):
-        self.policy = policy
-        self.future_steps = _policy_future_steps(policy)
-        self._fk = PolicyKeypointPinFK(policy)
-        self.keypoint_names = tuple(self._fk.keypoint_names)
-
-    @property
-    def size(self):
-        return len(self.future_steps) * len(self.keypoint_names) * 3
-
-    def reset(self):
-        pass
-
-    def update(self):
-        pass
-
-    def compute(self) -> np.ndarray:
-        if (
-            self.policy.ref_joint_pos is None
-            or self.policy.ref_root_quat is None
-            or self.policy.ref_root_pos is None
-        ):
-            raise ValueError("Ref data not available yet.")
-
-        base = self.policy.ref_idx
-        T = self.policy.ref_len
-        fut_idx = _clamp_indices(base + self.future_steps, T)
-
-        root_pos_w = self.policy.ref_root_pos[fut_idx]
-        root_quat_wxyz = self.policy.ref_root_quat[fut_idx]
-        joint_pos = self.policy.ref_joint_pos[fut_idx]
-
-        target_keypoints_w = self._fk.compute_keypoints_world(
-            root_pos_w=root_pos_w,
-            root_quat_wxyz=root_quat_wxyz,
-            joint_pos=joint_pos,
-        )  # [S, K, 3]
-        target_rel_w = target_keypoints_w - root_pos_w[0:1, None, :]
-        S, K, _ = target_rel_w.shape
-        target_keypoints_b = _quat_apply_inv(root_quat_wxyz[0], target_rel_w.reshape(S * K, 3)).reshape(S, K, 3)
-        return target_keypoints_b.reshape(-1).astype(np.float32)
 
 class RootAngVelBHistory(BaseObs):
     def __init__(self, ctrl, policy):

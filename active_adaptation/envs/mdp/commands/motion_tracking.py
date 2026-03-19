@@ -123,7 +123,6 @@ class MotionTrackingCommand(Command):
                 dataset_extra_keys: list[dict] = [],
                 keypoint_map: dict = {},
                 keypoint_patterns: list[str] = [],
-                policy_keypoint_patterns: list[str] = [],
                 lower_keypoint_patterns: list[str] = [],
                 upper_keypoint_patterns: list[str] = [],
                 joint_patterns: list[str] = [],
@@ -204,7 +203,6 @@ class MotionTrackingCommand(Command):
 
         # bodies for full‑body keypoint tracking
         self.keypoint_patterns = keypoint_patterns
-        self.policy_keypoint_patterns = policy_keypoint_patterns
         self.lower_keypoint_patterns = lower_keypoint_patterns
         self.upper_keypoint_patterns = upper_keypoint_patterns
         self.keypoint_map = keypoint_map
@@ -229,14 +227,6 @@ class MotionTrackingCommand(Command):
             name_map=self.keypoint_map,
             device=self.device
         )
-        self.policy_keypoint_idx_motion, self.policy_keypoint_idx_asset = _match_indices(
-            self.dataset.body_names,
-            self.asset.body_names,
-            self.policy_keypoint_patterns,
-            name_map=self.keypoint_map,
-            device=self.device
-        )
-        self.policy_keypoint_names = get_items_by_index(self.asset.body_names, self.policy_keypoint_idx_asset)
 
         # joints for full‑body joint tracking
         self.joint_patterns = joint_patterns
@@ -659,38 +649,6 @@ class MotionTrackingCommand(Command):
         return sym_utils.SymmetryTransform.cat([transform, transform])
 
     @observation
-    def target_policy_keypoints_pos_b_obs(self, horizon: str = "teacher", source: str = "modified", target_noise_std: float = 0.0):
-        motion = self._motion_for_horizon(horizon)
-        if source == "modified":
-            body_pos_w = motion.body_pos_w[:, :, self.policy_keypoint_idx_motion]
-        elif source == "original":
-            motion_original = self._motion_original_for_horizon(horizon)
-            body_pos_w = motion_original.body_pos_w[:, :, self.policy_keypoint_idx_motion]
-        else:
-            raise ValueError(
-                f"Invalid source '{source}', expected 'modified' or 'original'."
-            )
-        target_w = (
-            body_pos_w
-            - motion.root_pos_w[:, 0:1, :].unsqueeze(2)
-        )
-        target_b = quat_apply_inverse(
-            motion.root_quat_w[:, 0:1, :].unsqueeze(2),
-            target_w,
-        )
-        if target_noise_std > 0.0:
-            target_b = add_spherical_noise(target_b, target_noise_std)
-        return target_b.reshape(self.num_envs, -1)
-
-    def target_policy_keypoints_pos_b_obs_sym(self, horizon: str = "teacher", source: str = "modified"):
-        steps = self._steps_for_horizon(horizon)
-        return sym_utils.cartesian_space_symmetry(
-            self.asset,
-            get_items_by_index(self.asset.body_names, self.policy_keypoint_idx_asset),
-            sign=[1, -1, 1],
-        ).repeat(len(steps))
-
-    @observation
     def target_keypoints_rot_b_obs(self):
         target_quat_b = self._motion.body_quat_b[:, :, self.keypoint_idx_motion]
         target_rot6d_b = matrix_from_quat(target_quat_b)[..., :, :2].transpose(-2, -1)
@@ -888,7 +846,6 @@ class MotionTrackingCommand(Command):
         return self._keypoint_tracking(
             self.keypoint_idx_asset,
             self.keypoint_idx_motion,
-            "keypoint",
             update_cum_error=True,
             sigma=sigma,
         )
@@ -898,7 +855,6 @@ class MotionTrackingCommand(Command):
         return self._keypoint_tracking(
             self.lower_keypoint_idx_asset,
             self.lower_keypoint_idx_motion,
-            "lower_keypoint",
             sigma=sigma,
         )
 
@@ -907,7 +863,6 @@ class MotionTrackingCommand(Command):
         return self._keypoint_tracking(
             self.upper_keypoint_idx_asset,
             self.upper_keypoint_idx_motion,
-            "upper_keypoint",
             sigma=sigma,
         )
 
@@ -949,7 +904,7 @@ class MotionTrackingCommand(Command):
         error = (target_angvel_b - actual_angvel_b).norm(dim=-1).mean(dim=-1, keepdim=True)
         return _calc_exp_sigma(error, sigma)
 
-    def _keypoint_tracking(self, keypoint_idx_asset: torch.Tensor, keypoint_idx_motion: torch.Tensor, sigma_key: str, update_cum_error: bool = False, sigma: list[float] | None = None):
+    def _keypoint_tracking(self, keypoint_idx_asset: torch.Tensor, keypoint_idx_motion: torch.Tensor, update_cum_error: bool = False, sigma: list[float] | None = None):
         actual = self.asset.data.body_link_pos_w[:, keypoint_idx_asset]
         target = self.reward_keypoints_w[:, keypoint_idx_motion]
         diff = target - actual

@@ -1,35 +1,17 @@
-# good performance
-# policy_path: "assets/ckpts/G1TRACKING-03-11_22-34/policy.onnx" # [0, 1, 2, 4, 8, -1, -2, -4, -8]
-# policy_path: "assets/ckpts/G1TRACKING-03-10_15-55/policy.onnx" # [0, 1, 2, 4, 8, -1, -2, -4, -8] no target pos
-
 # low latency
-# policy_path: "assets/ckpts/G1TRACKING-03-11_23-00/policy.onnx" # [0, 1, 2, -1, -2, -4, -8, -12, -16]
-
-# fut = 4
-# policy_path: "assets/ckpts/G1TRACKING-03-13_17-54_0312.1/policy.onnx" # [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16]
-# policy_path: "assets/ckpts/G1TRACKING-03-13_17-53_0312.2/policy.onnx" # [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16]
-# policy_path: "assets/ckpts/G1TRACKING-03-13_17-51_0312.3/policy.onnx" # [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16]
-policy_path: "assets/ckpts/G1TRACKING-03-16_14-15_0315.2/policy.onnx" # [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16] with acc
+policy_path: "assets/ckpts/G1TRACKING-03-16_14-15_0315.2/policy.onnx"
 
 compliance_flag_value: 1.0 # 0.0 to disable compliance, 1.0 to enable compliance
 compliance_flag_threshold: 10.0 # 10.0 ~ 20.0
-# future_steps: [0, 1, 2, 4, 8, -1, -2, -4, -8] # format: [0, ...future, ...history]
-# future_steps: [0, 1, 2, -1, -2, -4, -8, -12, -16] # format: [0, ...future, ...history]
 future_steps: [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16] # format: [0, ...future, ...history]
-policy_keypoint_patterns: [".*ankle_roll_link", ".*_hand_mimic"]
-policy_keypoints_fk_urdf: "assets/g1/g1_29dof_rev_1_0_policy_fk.urdf"
 motion_source: "vr"
 vr_req_addr: "tcp://127.0.0.1:28701"
 vr_rep_addr: "tcp://127.0.0.1:28702"
 vr_ctrl_addr: "tcp://127.0.0.1:28703"
-vr_low_watermark: 5
-vr_high_watermark: 5
-vr_chunk_frames: 1
-vr_inflight_lifetime_steps: 0
-# root_angvel_history_steps: [0, 1, 2, 3, 4, 8]
-# projected_gravity_history_steps: [0, 1, 2, 3, 4, 8]
-# joint_pos_history_steps: [0, 1, 2, 3, 4, 8]
-# joint_vel_history_steps: [0, 1, 2, 3, 4, 8]
+vr_low_watermark: 5 # when to request frame
+vr_high_watermark: 5 # when to stop requesting frame; should be >= low_watermark
+vr_chunk_frames: 1 # how many frames to request each time
+vr_inflight_lifetime_steps: 0 # how many steps to wait before considering an inflight request as failed
 root_linacc_history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
 root_angvel_history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
 projected_gravity_history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
@@ -89,18 +71,6 @@ motions:
     end: -1
   - name: "walk3_subject1"
     path: "assets/data/walk3_subject1.npz"
-    start: 0
-    end: -1
-  - name: "sidewalk"
-    path: "assets/data/Strutting_SW.npz"
-    start: 0
-    end: -1
-  - name: "march"
-    path: "assets/data/March_FW.npz"
-    start: 0
-    end: -1
-  - name: "teleop"
-    path: "assets/data/teleop_retarget_20260308_123227_00001905.npz"
     start: 0
     end: -1
 motion_clips:
