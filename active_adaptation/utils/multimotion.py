@@ -265,15 +265,52 @@ class ProgressiveMultiMotionDataset:
                 setattr(data, f, v.to(dtype=dtype))
         return data
 
+    def _sample_joint_pos_bank_online(self, num_frames: int) -> torch.Tensor | None:
+        num_frames = int(num_frames)
+        if num_frames <= 0:
+            return None
+        ds_ids = torch.multinomial(self.probs, num_frames, replacement=True)
+        counts = torch.bincount(ds_ids, minlength=len(self.datasets))
+        chunks: list[torch.Tensor] = []
+
+        for i, cnt in enumerate(counts.tolist()):
+            if cnt <= 0:
+                continue
+            ds = self.datasets[i]
+            lengths = ds.lengths.to(dtype=torch.long, device=self.ds_device)
+            starts = ds.starts.to(dtype=torch.long, device=self.ds_device)
+            total_frames = int(lengths.sum().item())
+            if total_frames <= 0:
+                continue
+
+            flat_ids = torch.randint(0, total_frames, (cnt,), device=self.ds_device)
+            cdf = lengths.cumsum(dim=0)
+            motion_ids = torch.searchsorted(cdf, flat_ids, right=True)
+            prev_cdf = torch.zeros_like(flat_ids)
+            valid_mid = motion_ids > 0
+            prev_cdf[valid_mid] = cdf[motion_ids[valid_mid] - 1]
+            local_offsets = flat_ids - prev_cdf
+            frame_ids = starts[motion_ids] + local_offsets
+            joint_pos = ds.data.joint_pos[frame_ids].to(
+                device=self.device, dtype=self._buf_A.joint_pos.dtype
+            )
+            chunks.append(joint_pos)
+
+        if len(chunks) == 0:
+            return None
+
+        bank = torch.cat(chunks, dim=0)
+        perm = torch.randperm(bank.shape[0], device=bank.device)
+        return bank[perm].contiguous()
+
     def setup_joint_modification(
         self,
         *,
         ac_len_range: Sequence[int],
         b_ratio_range: Sequence[float],
         fps: float,
-        modify_b_tmid_prob: float,
         modify_b_dataset_prob: float,
-        modify_joint_pos_bank: torch.Tensor | None,
+        modify_joint_pos_bank_size: int = 20000,
         modify_joint_left_patterns: List[str],
         modify_joint_right_patterns: List[str],
         fk_asset: Any,
@@ -286,7 +323,6 @@ class ProgressiveMultiMotionDataset:
         self.modify_ac_len_range = tuple(int(x) for x in ac_len_range)
         self.modify_b_ratio_range = tuple(float(x) for x in b_ratio_range)
         self.modify_fps = float(fps)
-        self.modify_b_tmid_prob = float(modify_b_tmid_prob)
         self.modify_b_dataset_prob = float(modify_b_dataset_prob)
         self.modify_joint_left_patterns = list(modify_joint_left_patterns)
         self.modify_joint_right_patterns = list(modify_joint_right_patterns)
@@ -311,10 +347,13 @@ class ProgressiveMultiMotionDataset:
             raise ValueError("No joints matched modify_joint_left_patterns/modify_joint_right_patterns")
         self.modify_joint_left_ids = torch.tensor(left_ids, device=self.device, dtype=torch.long)
         self.modify_joint_right_ids = torch.tensor(right_ids, device=self.device, dtype=torch.long)
-        if modify_joint_pos_bank is not None:
-            self.modify_joint_pos_bank = modify_joint_pos_bank.to(
-                device=self.device, dtype=self._buf_A.joint_pos.dtype
-            ).contiguous()
+        self.modify_joint_pos_bank = self._sample_joint_pos_bank_online(
+            modify_joint_pos_bank_size
+        )
+        if self.modify_joint_pos_bank is None or self.modify_joint_pos_bank.numel() == 0:
+            raise RuntimeError(
+                f"Failed to sample non-empty modify_joint_pos_bank (size={modify_joint_pos_bank_size})."
+            )
 
         self._fk_helper = UpperBodyFKHelper.from_mjlab_asset(
             asset=self.modify_fk_asset,
@@ -344,9 +383,8 @@ class ProgressiveMultiMotionDataset:
             raise RuntimeError("modify_joint_left_ids/modify_joint_right_ids are not initialized")
         if fk_helper is None:
             raise RuntimeError("FK helper is not initialized")
-
-        env_ids_restore = env_ids_restore.to(self.device, dtype=torch.long)
-        env_ids_modify = env_ids_modify.to(self.device, dtype=torch.long)
+        if modify_joint_pos_bank is None or modify_joint_pos_bank.numel() == 0:
+            raise RuntimeError("modify_joint_pos_bank is not initialized or empty")
 
         # Restore original joint track first, then apply a new perturbation.
         self._buf_A.joint_pos[env_ids_restore] = original_joint_pos[env_ids_restore]
@@ -366,7 +404,6 @@ class ProgressiveMultiMotionDataset:
                 right_joint_ids=modify_joint_right_ids,
                 left_prob=self.modify_joint_left_prob,
                 right_prob=self.modify_joint_right_prob,
-                b_tmid_prob=self.modify_b_tmid_prob,
                 b_dataset_prob=self.modify_b_dataset_prob,
                 joint_pos_bank=modify_joint_pos_bank,
                 ac_len_range=self.modify_ac_len_range,

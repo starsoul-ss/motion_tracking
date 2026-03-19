@@ -76,21 +76,6 @@ command:
     root_ang_vel: 0.1
     joint_pos: 0.1
     joint_vel: 0.1
-  reward_sigma:
-    root_pos: [0.3]
-    root_vel: [1.0]
-    root_rot: [0.4]
-    root_ang_vel: [3.0]
-    
-    keypoint: [0.3] # product
-    keypoint_vel: [1.0] # product
-    keypoint_rot: [0.4] # product
-    keypoint_angvel: [3.0] # product
-    lower_keypoint: [0.2] # product
-    upper_keypoint: [0.3] # product
-
-    joint_pos: [0.5] # product
-    joint_vel: [3.0] # product
 
 observation:
   policy:
@@ -142,20 +127,20 @@ observation:
 
 reward:
   tracking:
-    root_pos_tracking:     {weight: 0.5}
-    root_rot_tracking:  {weight: 0.5}
-    root_vel_tracking:     {weight: 1.0}
-    root_ang_vel_tracking: {weight: 1.0}
+    root_pos_tracking:     {weight: 0.5, sigma: [0.3]}
+    root_rot_tracking:     {weight: 0.5, sigma: [0.4]}
+    root_vel_tracking:     {weight: 1.0, sigma: [1.0]}
+    root_ang_vel_tracking: {weight: 1.0, sigma: [3.0]}
 
-    keypoint_tracking:     {weight: 1.0}
-    keypoint_vel_tracking: {weight: 1.0}
-    keypoint_rot_tracking: {weight: 1.0}
-    keypoint_angvel_tracking: {weight: 1.0}
-    lower_keypoint_tracking: {weight: 0.5}
-    upper_keypoint_tracking: {weight: 0.5}
+    keypoint_tracking:        {weight: 1.0, sigma: [0.3]}
+    keypoint_vel_tracking:    {weight: 1.0, sigma: [1.0]}
+    keypoint_rot_tracking:    {weight: 1.0, sigma: [0.4]}
+    keypoint_angvel_tracking: {weight: 1.0, sigma: [3.0]}
+    lower_keypoint_tracking:  {weight: 0.5, sigma: [0.2]}
+    upper_keypoint_tracking:  {weight: 0.5, sigma: [0.3]}
 
-    joint_pos_tracking:    {weight: 1.0}
-    joint_vel_tracking:    {weight: 0.5}
+    joint_pos_tracking:    {weight: 1.0, sigma: [0.5]}
+    joint_vel_tracking:    {weight: 0.5, sigma: [3.0]}
   loco:
     survival:           {weight: 3.0, enabled: true}
     # impact_force_l2:    {weight: 4.0, enabled: true, body_names: .*ankle_roll_link}
@@ -163,7 +148,7 @@ reward:
     joint_vel_l2:       {weight: 5.0e-4, enabled: true, joint_names: .*}
     action_rate_l2:     {weight: 0.01, enabled: true}
     feet_air_time_ref:  {weight: 5.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], thres: 0.5}
-    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe], air_h_low: 0.035, air_h_high: 0.125, contact_h_low: 0.035, contact_h_high: 0.125}
+    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe], air_h_low: 0.035, air_h_high: 0.155, contact_h_low: 0.035, contact_h_high: 0.125}
     joint_pos_limits:   {weight: 1.0, joint_names: ".*", soft_factor: 0.9, enabled: true}
     joint_torque_limits: {weight: 0.01, joint_names: ".*", soft_factor: 0.75, enabled: true}
     feet_contact_count: {weight: 1.0, enabled: false, body_names: .*ankle_roll_link, }

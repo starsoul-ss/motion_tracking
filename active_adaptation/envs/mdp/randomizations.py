@@ -402,12 +402,11 @@ class motion_tracking_target_joint_pos_bias(Randomization):
         )
 
     def reset(self, env_ids: torch.Tensor):
-        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         if env_ids.numel() == 0 or self.command._target_joint_pos_bias.shape[1] == 0:
             return
         n = env_ids.numel()
         joint_noise = sample_uniform((n, self.command._target_joint_pos_bias.shape[1]), -1.0, 1.0, device=self.device)
-        self.command._target_joint_pos_bias[env_ids] = joint_noise.to(self.command._target_joint_pos_bias.dtype) * self.target_joint_pos_bias_std.unsqueeze(0)
+        self.command._target_joint_pos_bias[env_ids] = joint_noise * self.target_joint_pos_bias_std.unsqueeze(0)
 
 
 class motion_tracking_root_drift_vel(Randomization):
@@ -418,7 +417,6 @@ class motion_tracking_root_drift_vel(Randomization):
         self.root_drift_vel_z_max = max(float(root_drift_vel_z_max), 0.0)
 
     def reset(self, env_ids: torch.Tensor):
-        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
             return
         n = env_ids.numel()
@@ -437,7 +435,7 @@ class motion_tracking_root_drift_vel(Randomization):
                 -self.root_drift_vel_z_max,
                 self.root_drift_vel_z_max,
                 device=self.device,
-            ).to(self.command._root_drift_vel_w.dtype)
+            )
 
 
 class motion_tracking_root_z_offset(Randomization):
@@ -454,7 +452,6 @@ class motion_tracking_root_z_offset(Randomization):
             )
 
     def reset(self, env_ids: torch.Tensor):
-        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
             return
         self.command._root_z_offset[env_ids] = sample_uniform(
@@ -462,7 +459,7 @@ class motion_tracking_root_z_offset(Randomization):
             self.z_offset_low,
             self.z_offset_high,
             device=self.device,
-        ).to(self.command._root_z_offset.dtype)
+        )
 
 
 class perturb_root_vel(Randomization):

@@ -138,9 +138,8 @@ def apply_joint_abc_modification_(
     right_joint_ids: torch.Tensor,
     left_prob: float,
     right_prob: float,
-    b_tmid_prob: float,
     b_dataset_prob: float,
-    joint_pos_bank: torch.Tensor | None,
+    joint_pos_bank: torch.Tensor,
     ac_len_range: Sequence[int],
     b_ratio_range: Sequence[float],
     fps: float,
@@ -158,11 +157,8 @@ def apply_joint_abc_modification_(
     E, T, J = joint_pos.shape
     dev = joint_pos.device
 
-    lengths = lengths.to(device=dev, dtype=torch.long)
-    left_joint_ids = left_joint_ids.to(device=dev, dtype=torch.long)
-    right_joint_ids = right_joint_ids.to(device=dev, dtype=torch.long)
-    if joint_pos_bank is not None:
-        joint_pos_bank = joint_pos_bank.to(device=dev, dtype=joint_pos.dtype)
+    if joint_pos_bank is None or joint_pos_bank.numel() == 0:
+        raise RuntimeError("apply_joint_abc_modification_ requires non-empty joint_pos_bank.")
 
     q_sel = joint_pos
     v_sel = joint_vel
@@ -177,20 +173,17 @@ def apply_joint_abc_modification_(
 
     env_idx = torch.arange(E, device=dev, dtype=torch.long)
     q_b_tmid = q_sel[env_idx, t_mid]
-    if joint_pos_bank is not None and joint_pos_bank.shape[0] > 0:
-        bank_rows = torch.randint(
-            0,
-            joint_pos_bank.shape[0],
-            (E,),
-            device=dev,
-            generator=generator,
-        )
-        q_b_bank = joint_pos_bank.index_select(0, bank_rows)
-        p_dataset = b_dataset_prob / (b_tmid_prob + b_dataset_prob)
-        use_bank = torch.rand((E,), device=dev, generator=generator) < p_dataset
-        q_b = torch.where(use_bank.unsqueeze(-1), q_b_bank, q_b_tmid)
-    else:
-        q_b = q_b_tmid
+    bank_rows = torch.randint(
+        0,
+        joint_pos_bank.shape[0],
+        (E,),
+        device=dev,
+        generator=generator,
+    )
+    q_b_bank = joint_pos_bank.index_select(0, bank_rows)
+    p_dataset = float(max(0.0, min(1.0, b_dataset_prob)))
+    use_bank = torch.rand((E,), device=dev, generator=generator) < p_dataset
+    q_b = torch.where(use_bank.unsqueeze(-1), q_b_bank, q_b_tmid)
 
     q_new, v_new, ac_mask = apply_joint_abc_curve_(
         q_sel,

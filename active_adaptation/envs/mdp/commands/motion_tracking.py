@@ -1,7 +1,6 @@
 import torch
 
 from typing import TYPE_CHECKING
-from pathlib import Path
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity as RigidObject
@@ -44,6 +43,8 @@ def _match_indices(motion_names, asset_names, patterns, name_map=None, device=No
     return torch.tensor(motion_idx, device=device), torch.tensor(asset_idx, device=device)
 
 def _calc_exp_sigma(error : torch.Tensor, sigma_list : list[float], reduce_last_dim : bool = False):
+    if sigma_list is None or len(sigma_list) == 0:
+        raise ValueError("sigma must be provided and non-empty.")
     count = len(sigma_list)
     if reduce_last_dim:
         rewards = [torch.exp(- error / sigma).mean(dim=-1, keepdim=True) for sigma in sigma_list]
@@ -135,7 +136,6 @@ class MotionTrackingCommand(Command):
                 feet_standing_vz_enter: float = 0.20,
                 feet_standing_vz_exit: float = 0.35,
                 init_noise: dict[str, float] = {},
-                reward_sigma: dict[str, list[float]] = {},
                 future_steps: list[int] = [],
                 student_future_steps: list[int] | None = None,
                 cum_root_pos_scale: float = 0.0,
@@ -330,8 +330,6 @@ class MotionTrackingCommand(Command):
 
         ## init noise
         self.init_noise_params = init_noise
-        ## reward sigma
-        self.reward_sigma = reward_sigma
 
     def _steps_for_horizon(self, horizon: str = "teacher") -> torch.Tensor:
         horizon_key = str(horizon).lower()
@@ -368,10 +366,10 @@ class MotionTrackingCommand(Command):
     def _apply_root_drift(self, root_pos_w: torch.Tensor, horizon: str = "teacher"):
         if str(horizon).lower() != "student":
             return root_pos_w
-        steps = self._steps_for_horizon(horizon).to(device=root_pos_w.device, dtype=root_pos_w.dtype)
+        steps = self._steps_for_horizon(horizon)
         offsets = steps.view(1, -1, 1) * float(self.env.step_dt)
-        root_pos_w = root_pos_w + self._root_drift_vel_w.to(dtype=root_pos_w.dtype).unsqueeze(1) * offsets
-        root_pos_w[..., 2] = root_pos_w[..., 2] + self._root_z_offset.to(dtype=root_pos_w.dtype).unsqueeze(1)
+        root_pos_w = root_pos_w + self._root_drift_vel_w.unsqueeze(1) * offsets
+        root_pos_w[..., 2] = root_pos_w[..., 2] + self._root_z_offset.unsqueeze(1)
         return root_pos_w
 
     def sample_init(self, env_ids: torch.Tensor):
@@ -837,16 +835,16 @@ class MotionTrackingCommand(Command):
         )
 
     @reward
-    def root_pos_tracking(self):
+    def root_pos_tracking(self, sigma: list[float] | None = None):
         current_pos = self.asset.data.root_link_pos_w
         target_pos = self.reward_root_pos_w
         diff = target_pos - current_pos
         error = diff.norm(dim=-1, keepdim=True)
         self._cum_error[:, 0:1] = error / self._cum_root_pos_scale
-        return _calc_exp_sigma(error, self.reward_sigma["root_pos"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def root_vel_tracking(self):
+    def root_vel_tracking(self, sigma: list[float] | None = None):
         current_linvel_w = self.asset.data.root_link_lin_vel_w
         current_quat = self.asset.data.root_link_quat_w
         ref_linvel_w = self._motion.root_lin_vel_w[:, 0]
@@ -857,10 +855,10 @@ class MotionTrackingCommand(Command):
         diff = ref_linvel_b - current_linvel_b
 
         error = diff.norm(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["root_vel"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def root_rot_tracking(self):
+    def root_rot_tracking(self, sigma: list[float] | None = None):
         current_quat = self.asset.data.root_link_quat_w
         target_quat = self.reward_root_quat_w
         diff = axis_angle_from_quat(quat_mul(
@@ -869,10 +867,10 @@ class MotionTrackingCommand(Command):
         ))
         error = torch.norm(diff, dim=-1, keepdim=True)
         self._cum_error[:, 1:2] = error / self._cum_orientation_scale
-        return _calc_exp_sigma(error, self.reward_sigma["root_rot"])
+        return _calc_exp_sigma(error, sigma)
     
     @reward
-    def root_ang_vel_tracking(self):
+    def root_ang_vel_tracking(self, sigma: list[float] | None = None):
         current_angvel_w = self.asset.data.root_link_ang_vel_w
         current_quat = self.asset.data.root_link_quat_w
         ref_angvel_w = self._motion.root_ang_vel_w[:, 0]
@@ -883,35 +881,38 @@ class MotionTrackingCommand(Command):
         diff = ref_angvel_b - current_angvel_b
 
         error = diff.norm(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["root_ang_vel"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def keypoint_tracking(self):
+    def keypoint_tracking(self, sigma: list[float] | None = None):
         return self._keypoint_tracking(
             self.keypoint_idx_asset,
             self.keypoint_idx_motion,
             "keypoint",
             update_cum_error=True,
+            sigma=sigma,
         )
     
     @reward
-    def lower_keypoint_tracking(self):
+    def lower_keypoint_tracking(self, sigma: list[float] | None = None):
         return self._keypoint_tracking(
             self.lower_keypoint_idx_asset,
             self.lower_keypoint_idx_motion,
             "lower_keypoint",
+            sigma=sigma,
         )
 
     @reward
-    def upper_keypoint_tracking(self):
+    def upper_keypoint_tracking(self, sigma: list[float] | None = None):
         return self._keypoint_tracking(
             self.upper_keypoint_idx_asset,
             self.upper_keypoint_idx_motion,
             "upper_keypoint",
+            sigma=sigma,
         )
 
     @reward
-    def keypoint_vel_tracking(self):
+    def keypoint_vel_tracking(self, sigma: list[float] | None = None):
         current_root_quat = self.asset.data.root_link_quat_w
         actual_vel_w = self.asset.data.body_link_lin_vel_w[:, self.keypoint_idx_asset]
         actual_vel_b = quat_apply_inverse(
@@ -921,10 +922,10 @@ class MotionTrackingCommand(Command):
 
         target_vel_b = self._motion.body_vel_b[:, 0, self.keypoint_idx_motion]
         error = (target_vel_b - actual_vel_b).norm(dim=-1).mean(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["keypoint_vel"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def keypoint_rot_tracking(self):
+    def keypoint_rot_tracking(self, sigma: list[float] | None = None):
         current_root_quat = self.asset.data.root_link_quat_w
         actual_quat_b = quat_mul(
             quat_conjugate(current_root_quat).unsqueeze(1),
@@ -933,10 +934,10 @@ class MotionTrackingCommand(Command):
         target_quat_b = self._motion.body_quat_b[:, 0, self.keypoint_idx_motion]
         diff = axis_angle_from_quat(quat_mul(target_quat_b, quat_conjugate(actual_quat_b)))
         error = diff.norm(dim=-1).mean(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["keypoint_rot"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def keypoint_angvel_tracking(self):
+    def keypoint_angvel_tracking(self, sigma: list[float] | None = None):
         current_root_quat = self.asset.data.root_link_quat_w
         actual_angvel_w = self.asset.data.body_link_ang_vel_w[:, self.keypoint_idx_asset]
         root_angvel_w = self.asset.data.root_link_ang_vel_w.unsqueeze(1)
@@ -946,36 +947,30 @@ class MotionTrackingCommand(Command):
         )
         target_angvel_b = self._motion.body_angvel_b[:, 0, self.keypoint_idx_motion]
         error = (target_angvel_b - actual_angvel_b).norm(dim=-1).mean(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["keypoint_angvel"])
+        return _calc_exp_sigma(error, sigma)
 
-    def _keypoint_tracking(
-        self,
-        keypoint_idx_asset: torch.Tensor,
-        keypoint_idx_motion: torch.Tensor,
-        sigma_key: str,
-        update_cum_error: bool = False,
-    ):
+    def _keypoint_tracking(self, keypoint_idx_asset: torch.Tensor, keypoint_idx_motion: torch.Tensor, sigma_key: str, update_cum_error: bool = False, sigma: list[float] | None = None):
         actual = self.asset.data.body_link_pos_w[:, keypoint_idx_asset]
         target = self.reward_keypoints_w[:, keypoint_idx_motion]
         diff = target - actual
         error = diff.norm(dim=-1).mean(dim=-1, keepdim=True)
         if update_cum_error:
             self._cum_error[:, 2:3] = error / self._cum_keypoint_scale
-        return _calc_exp_sigma(error, self.reward_sigma[sigma_key])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def joint_pos_tracking(self):
+    def joint_pos_tracking(self, sigma: list[float] | None = None):
         actual = self.asset.data.joint_pos[:, self.joint_idx_asset]
         target = self._motion.joint_pos[:, 0, self.joint_idx_motion]
         error = (target - actual).abs().mean(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["joint_pos"])
+        return _calc_exp_sigma(error, sigma)
 
     @reward
-    def joint_vel_tracking(self):
+    def joint_vel_tracking(self, sigma: list[float] | None = None):
         actual = self.asset.data.joint_vel[:, self.joint_idx_asset]
         target = self._motion.joint_vel[:, 0, self.joint_idx_motion]
         error = (target - actual).abs().mean(dim=-1, keepdim=True)
-        return _calc_exp_sigma(error, self.reward_sigma["joint_vel"])
+        return _calc_exp_sigma(error, sigma)
 
     def update_reward_target_raw(self):
         delta_quat = quat_mul(
@@ -1117,7 +1112,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
         modify_ac_len_range: Sequence[int] = (100, 800),
         modify_b_ratio_range: Sequence[float] = (0.3, 0.7),
         modify_fps: float = 50.0,
-        modify_b_tmid_prob: float = 0.2,
         modify_b_dataset_prob: float = 0.8,
         modify_joint_left_patterns: list[str] = (".*left_.*shoulder.*", ".*left_.*elbow.*"),
         modify_joint_right_patterns: list[str] = (".*right_.*shoulder.*", ".*right_.*elbow.*"),
@@ -1177,20 +1171,12 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
         self.net_force_limit = torch.zeros((), dtype=torch.float32, device=self.device)
         self.net_torque_limit = torch.zeros((), dtype=torch.float32, device=self.device)
 
-        bank_path = Path(__file__).resolve().parent / "g1_tracking_compliance.pt"
-        bank_obj = torch.load(str(bank_path), map_location="cpu")
-        modify_joint_pos_bank = bank_obj["joint_pos"]
-        bank_joint_names = bank_obj.get("joint_names", None)
-        if bank_joint_names is not None and list(bank_joint_names) != list(self.dataset.joint_names):
-            raise ValueError("joint bank joint_names mismatch with current dataset.joint_names")
-
         self.dataset.setup_joint_modification(
             ac_len_range=modify_ac_len_range,
             b_ratio_range=modify_b_ratio_range,
             fps=modify_fps,
-            modify_b_tmid_prob=modify_b_tmid_prob,
             modify_b_dataset_prob=modify_b_dataset_prob,
-            modify_joint_pos_bank=modify_joint_pos_bank,
+            modify_joint_pos_bank_size=20000,
             modify_joint_left_patterns=modify_joint_left_patterns,
             modify_joint_right_patterns=modify_joint_right_patterns,
             fk_asset=self.asset,
@@ -1238,7 +1224,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
     def _maybe_resample_joint_modify(self, env_ids: torch.Tensor):
         if env_ids.numel() == 0:
             return
-        env_ids = env_ids.to(self.device, dtype=torch.long)
         due_mask = self.modify_countdown[env_ids] <= 0
         if not due_mask.any():
             return

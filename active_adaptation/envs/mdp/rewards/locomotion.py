@@ -1,4 +1,5 @@
 from math import inf
+import inspect
 import torch
 import abc
 from typing import TYPE_CHECKING, Callable, List, Tuple
@@ -73,9 +74,30 @@ def reward_func(func):
 
 
 def reward_wrapper(func: Callable[[], torch.Tensor]):
+    def _select_kwargs(fn: Callable, params: dict):
+        sig = inspect.signature(fn)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return dict(params), True
+        valid_keys = {
+            name for name, p in sig.parameters.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        return {k: v for k, v in params.items() if k in valid_keys}, False
+
     class RewardWrapper(Reward):
+        def __init__(self, env, weight: float, enabled: bool = True, **params):
+            super().__init__(env, weight=weight, enabled=enabled)
+            self.params = params
+            self._func_kwargs, func_accepts_all = _select_kwargs(func, params)
+            if not func_accepts_all:
+                unknown = set(params.keys()) - set(self._func_kwargs.keys())
+                if len(unknown) > 0:
+                    raise ValueError(
+                        f"Unknown YAML params for wrapped reward '{func.__name__}': {sorted(unknown)}"
+                    )
+
         def compute(self):
-            return func()
+            return func(**self._func_kwargs)
     return RewardWrapper
 
 
