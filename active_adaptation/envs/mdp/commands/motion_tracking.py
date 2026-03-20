@@ -10,7 +10,6 @@ from active_adaptation.envs.mdp import reward, termination, observation, random_
 from active_adaptation.utils.multimotion import (
     ProgressiveMultiMotionDataset,
 )
-from active_adaptation.utils.simple_multimotion import SimpleSequentialMultiMotionDataset
 from active_adaptation.utils import symmetry as sym_utils
 from active_adaptation.utils import joint_order as joint_order_utils
 from active_adaptation.utils.math import (
@@ -121,6 +120,7 @@ def _resolve_joint_indices(
 class MotionTrackingCommand(Command):
     def __init__(self, env, dataset: dict,
                 dataset_extra_keys: list[dict] = [],
+                required_motion_body_patterns: list[str] = [],
                 keypoint_map: dict = {},
                 keypoint_patterns: list[str] = [],
                 lower_keypoint_patterns: list[str] = [],
@@ -179,12 +179,12 @@ class MotionTrackingCommand(Command):
         ]
 
         self.debug_mode = debug_mode
-
-        dataset_cls = SimpleSequentialMultiMotionDataset if self.debug_mode else ProgressiveMultiMotionDataset
-        self.dataset = dataset_cls(
+        self.dataset = ProgressiveMultiMotionDataset(
             **dataset,
             env_size=self.num_envs,
             max_step_size=1000,
+            required_motion_body_patterns=required_motion_body_patterns,
+            fk_asset=self.asset,
             dataset_extra_keys=dataset_extra_keys,
             device=self.device,
             ds_device=torch.device("cpu"), # dataset will consume a lot of memory, keep it on CPU and move slices to GPU as needed
@@ -1070,8 +1070,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
         modify_b_dataset_prob: float = 0.8,
         modify_joint_left_patterns: list[str] = (".*left_.*shoulder.*", ".*left_.*elbow.*"),
         modify_joint_right_patterns: list[str] = (".*right_.*shoulder.*", ".*right_.*elbow.*"),
-        modify_fk_base_body_name: str = "pelvis",
-        modify_fk_ee_link_names: Sequence[str] = ("left_hand_mimic", "right_hand_mimic"),
         modify_resample_countdown_steps: int = 5000,
         modify_resample_prob: float = 0.75,
         force_threshold_range: Sequence[float] = (10.0, 20.0),
@@ -1135,8 +1133,6 @@ class MotionTrackingComplianceCommand(MotionTrackingCommand):
             modify_joint_left_patterns=modify_joint_left_patterns,
             modify_joint_right_patterns=modify_joint_right_patterns,
             fk_asset=self.asset,
-            fk_base_body_name=modify_fk_base_body_name,
-            fk_ee_link_names=modify_fk_ee_link_names,
         )
         self.modify_suitable_flags = self._compute_modify_suitable_flags()
         self.step_schedule(0.0, None)

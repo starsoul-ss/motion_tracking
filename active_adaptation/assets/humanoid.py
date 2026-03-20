@@ -93,8 +93,8 @@ SPATIAL_SYMMETRY_MAP = {
     "left_hand_mimic": "right_hand_mimic",
     "right_hand_mimic": "left_hand_mimic",
     "head_mimic": "head_mimic",
-    "right_ankle_roll_link_toe": "left_ankle_roll_link_toe",
-    "left_ankle_roll_link_toe": "right_ankle_roll_link_toe",
+    "right_ankle_roll_toe_link": "left_ankle_roll_toe_link",
+    "left_ankle_roll_toe_link": "right_ankle_roll_toe_link",
 }
 
 G1_INIT_STATE = EntityCfg.InitialStateCfg(

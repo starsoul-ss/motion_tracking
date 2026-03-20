@@ -98,7 +98,7 @@
                 <geom class="visual" mesh="left_ankle_pitch_link"/>
                 <body name="left_ankle_roll_link" pos="0 0 -0.017558">
                   <!-- <site name="left_foot" rgba="1 0 0 1" pos="0.04 0 -0.037"/> -->
-                  <body name="left_ankle_roll_link_toe" pos="0.1 0 0"/>
+                  <body name="left_ankle_roll_toe_link" pos="0.1 0 0"/>
                   <inertial pos="0.026505 0 -0.016425" quat="-0.000481092 0.728482 -0.000618967 0.685065" mass="0.608"
                     diaginertia="0.00167218 0.0016161 0.000217621"/>
                   <joint name="left_ankle_roll_joint" axis="1 0 0" range="-0.2618 0.2618"/>
@@ -153,7 +153,7 @@
                 <geom class="visual" mesh="right_ankle_pitch_link"/>
                 <body name="right_ankle_roll_link" pos="0 0 -0.017558">
                   <!-- <site name="right_foot" rgba="1 0 0 1" pos="0.04 0 -0.037"/> -->
-                  <body name="right_ankle_roll_link_toe" pos="0.1 0 0"/>
+                  <body name="right_ankle_roll_toe_link" pos="0.1 0 0"/>
                   <inertial pos="0.026505 0 -0.016425" quat="0.000481092 0.728482 0.000618967 0.685065" mass="0.608"
                     diaginertia="0.00167218 0.0016161 0.000217621"/>
                   <joint name="right_ankle_roll_joint" axis="1 0 0" range="-0.2618 0.2618"/>

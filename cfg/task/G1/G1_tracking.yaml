@@ -29,6 +29,7 @@ action:
 flags: []
 command:
   _target_: active_adaptation.envs.mdp.commands.motion_tracking.MotionTrackingComplianceCommand
+  required_motion_body_patterns: ["pelvis", ".*torso.*", "head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link", ".*hip_yaw_link", ".*knee.*", ".*ankle_roll_link"]
   keypoint_map: {}
   keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*", ".*shoulder_yaw_link", ".*hip_yaw_link", ".*knee.*", ".*ankle_roll_link"]
   lower_keypoint_patterns: [".*knee.*", ".*hip_yaw_link", ".*ankle_roll_link"]
@@ -44,17 +45,19 @@ command:
   joint_patterns: [".*hip.*", ".*knee.*", ".*shoulder.*", ".*elbow.*", ".*wrist.*", ".*waist.*"]
   dataset:
     mem_paths:
+      # - seed
       - lafan_all
       - amass_all
       - 100style
       - amass_hard
       - real_vr
     path_weights:
+      # - 0.9
       - 0.3
       - 0.3
       - 0.3
-      - 0.1
-      - 0.1
+      - 0.05
+      - 0.05
   dataset_extra_keys: []
   future_steps: [0, 1, 2, 4, 8, 12, 16, 20, -1, -2, -4, -8]
   student_future_steps: [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16]
@@ -146,7 +149,7 @@ reward:
     joint_vel_l2:       {weight: 5.0e-4, enabled: true, joint_names: .*}
     action_rate_l2:     {weight: 0.01, enabled: true}
     feet_air_time_ref:  {weight: 5.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], thres: 0.5}
-    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe], air_h_low: 0.035, air_h_high: 0.155, contact_h_low: 0.035, contact_h_high: 0.125}
+    feet_air_time_ref_dense:  {weight: 1.0, enabled: true, body_names: [left_ankle_roll_link, right_ankle_roll_link], body2_names: [left_ankle_roll_toe_link, right_ankle_roll_toe_link], air_h_low: 0.035, air_h_high: 0.155, contact_h_low: 0.035, contact_h_high: 0.125}
     joint_pos_limits:   {weight: 1.0, joint_names: ".*", soft_factor: 0.9, enabled: true}
     joint_torque_limits: {weight: 0.01, joint_names: ".*", soft_factor: 0.75, enabled: true}
     feet_contact_count: {weight: 1.0, enabled: false, body_names: .*ankle_roll_link, }

@@ -9,7 +9,11 @@ import torch
 from active_adaptation.utils.motion import MotionDataset
 
 EXCLUDE_LABEL_PATH = Path(__file__).parent / "label.txt"
+SEED_KEEP_FILENAMES_PATH = Path("/home/axell/Desktop/dataset_new/retarget_g1/seed/keep_filenames.txt")
 EXCLUDED_PATHS = set()
+SEED_KEEP_FILENAMES = set()
+ENABLE_AMASS_FILTER = False
+ENABLE_SEED_FILTER = False
 EXCLUDED_SUBSTRINGS = [
     "CMU/94",
     "CMU/126",
@@ -71,6 +75,17 @@ def load_excluded_paths(label_path: Path) -> set[str]:
                 paths.add(token)
     return paths
 
+def load_keep_filenames(list_path: Path) -> set[str]:
+    if not list_path.exists():
+        return set()
+    names = set()
+    with list_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            name = line.strip()
+            if name:
+                names.add(name)
+    return names
+
 def check_motion(motion, foot_idx, path, start_idx, end_idx) -> bool:
     """Return False when the motion violates basic physical sanity checks."""
 
@@ -79,11 +94,15 @@ def check_motion(motion, foot_idx, path, start_idx, end_idx) -> bool:
     xpos = motion["xpos"]
 
     path_str = str(path)
-    if EXCLUDED_PATHS and path_str in EXCLUDED_PATHS:
-        print("Invalid motion due to excluded path")
-        return False
-    if any(s in path_str for s in EXCLUDED_SUBSTRINGS):
-        print("Invalid motion due to excluded substring")
+    if ENABLE_AMASS_FILTER:
+        if EXCLUDED_PATHS and path_str in EXCLUDED_PATHS:
+            print("Invalid motion due to excluded path")
+            return False
+        if any(s in path_str for s in EXCLUDED_SUBSTRINGS):
+            print("Invalid motion due to excluded substring")
+            return False
+    if ENABLE_SEED_FILTER and SEED_KEEP_FILENAMES and path.stem not in SEED_KEEP_FILENAMES:
+        print("Invalid motion due to missing keep filename")
         return False
 
     if np.any(np.abs(qvel[:, :6]) > 10):
@@ -117,11 +136,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-root", required=True, help="NPZ file or directory to convert")
     ap.add_argument("--mem-path", required=True, help="Output memmap directory")
+    ap.add_argument("--amass-filter", action="store_true", help="Enable AMASS-specific path/name filters")
+    ap.add_argument("--seed-filter", action="store_true", help="Enable seed keep_filenames allowlist filter")
     args = ap.parse_args()
 
     dataset_root = Path(args.dataset_root)
-    global EXCLUDED_PATHS
-    EXCLUDED_PATHS = load_excluded_paths(EXCLUDE_LABEL_PATH)
+    global EXCLUDED_PATHS, SEED_KEEP_FILENAMES, ENABLE_AMASS_FILTER, ENABLE_SEED_FILTER
+    ENABLE_AMASS_FILTER = args.amass_filter
+    ENABLE_SEED_FILTER = args.seed_filter
+    EXCLUDED_PATHS = load_excluded_paths(EXCLUDE_LABEL_PATH) if ENABLE_AMASS_FILTER else set()
+    SEED_KEEP_FILENAMES = load_keep_filenames(SEED_KEEP_FILENAMES_PATH) if ENABLE_SEED_FILTER else set()
 
     MotionDataset.create_from_path(
         str(dataset_root),
@@ -130,8 +154,6 @@ def main():
         callback=none_callback,
         motion_processer=partial(preprocess_motion, always_on_ground=False),
         motion_filter=check_motion,
-        pad_before=0,
-        pad_after=0,
         segment_len=1000,
         storage_float_dtype=torch.float16,
         storage_int_dtype=torch.int32,
