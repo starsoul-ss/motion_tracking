@@ -1,37 +1,54 @@
 import warnings
-import copy
-from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Union
-
+from typing import Any, Dict, List, Union
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import einops
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchrl.data import Composite, TensorSpec
-from torchrl.envs.transforms import TensorDictPrimer, ExcludeTransform
 from torchrl.modules import ProbabilisticActor
 from tensordict import TensorDict
 from tensordict.nn import (
     TensorDictModuleBase,
     TensorDictModule as Mod,
     TensorDictSequential as Seq,
-    CudaGraphModule
 )
 
 from hydra.core.config_store import ConfigStore
 
 # ---- utils ------------------------------------------------------------------------------------ #
 from ..modules.distributions import IndependentNormal
-from ..utils.valuenorm import ValueNorm1, ValueNormFake
+from ..modules.valuenorm import ValueNorm1, ValueNormFake
 from .common import *
+from ..modules.opt import build_optimizer
 import active_adaptation as aa
-import functools
 
 __all__ = ["PPOPolicy", "PPOConfig"]
+
+
+def _schedule_value(schedule: Any, progress: float) -> float:
+    if isinstance(schedule, (int, float)):
+        return float(schedule)
+
+    points = [(float(x), float(y)) for x, y in schedule]
+    if not points:
+        raise ValueError("schedule cannot be empty")
+
+    progress = float(progress)
+    if progress <= points[0][0]:
+        return points[0][1]
+
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x1 <= x0:
+            raise ValueError("schedule progress points must be strictly increasing")
+        if progress <= x1:
+            return y0 + (y1 - y0) * (progress - x0) / (x1 - x0)
+
+    return points[-1][1]
+
 
 # ------------------------------------------------------------------------------------------------ #
 # 1. Config
@@ -45,11 +62,27 @@ class PPOConfig:
 
     # PPO hyper‑params
     train_every: int = 32
-    ppo_epochs: int = 5
+    ppo_epochs: int = 3
     num_minibatches: int = 8
 
-    lr: float = 5e-4
-    desired_kl: float = 0.01 # kl schedule
+    actor_start_lr: float = 1e-4
+    # actor_start_lr: float = 5e-4
+    critic_lr: float = 5e-4
+    optimizer: str = "muon"  # adam | muon
+    optimizer_weight_decay: float = 0.0
+
+    # actor lr scheduling based on kl divergence
+    desired_kl_upper: Any = field(default_factory=lambda: [
+        [0.0, 0.015],
+        [0.15, 0.015],
+        [0.2, 0.01],
+        [0.8, 0.0075],
+        [1.0, 0.0075],
+    ])
+    desired_kl_lower: Any = 0.0
+    lr_schedule_scale_factor: float = 1.05
+    lr_schedule_min: float = 1e-7
+    lr_schedule_max: float = 1e-3
 
     clip_param: float = 0.2
 
@@ -78,7 +111,7 @@ class PPOConfig:
         default_factory=lambda: [
             OBS_KEY,
             OBS_PRIV_KEY,
-            CRITIC_PRIV_KEY
+            CRITIC_PRIV_KEY,
         ]
     )
 
@@ -87,11 +120,15 @@ class PPOConfig:
 
 
 cs = ConfigStore.instance()
-cs.store("ppo_train", node=PPOConfig(phase="train", vecnorm="train", entropy_coef_start=0.01, entropy_coef_end=0.0025), group="algo")
+cs.store("ppo_train", node=PPOConfig(phase="train", vecnorm="train", entropy_coef_start=0.01, entropy_coef_end=0.005), group="algo")
 cs.store("ppo_adapt", node=PPOConfig(phase="adapt", vecnorm="eval", train_every=16), group="algo")
-cs.store("ppo_finetune", node=PPOConfig(phase="finetune", vecnorm="eval", lr=1e-4, entropy_coef_start=0.0025, entropy_coef_end=0.0005), group="algo")
+cs.store("ppo_finetune", node=PPOConfig(phase="finetune", vecnorm="eval", entropy_coef_start=0.005, entropy_coef_end=0.0025), group="algo")
+
 
 class PPOPolicy(TensorDictModuleBase):
+    # ------------------------------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------------------------------ #
     def __init__(
         self,
         cfg: PPOConfig,
@@ -118,7 +155,6 @@ class PPOPolicy(TensorDictModuleBase):
         self.reg_lambda = 0.0  # will be annealed
         self.num_minibatches = cfg.num_minibatches
         self.progress = 0.0
-        self.current_lr = cfg.lr
 
         self.reward_groups = list(env.cfg.reward.keys())
 
@@ -138,7 +174,7 @@ class PPOPolicy(TensorDictModuleBase):
         # ---------------------------------------------------------------------------- state estimator (student)
         self.adapt_module = Mod(
             nn.Sequential(
-                make_mlp([512, 512]),
+                make_mlp([1024, 512]),
                 nn.LazyLinear(self.cfg.latent_dim),
             ),
             [OBS_KEY],
@@ -152,7 +188,7 @@ class PPOPolicy(TensorDictModuleBase):
             return ProbabilisticActor(
                 module=Seq(
                     CatTensors(in_keys, "_actor_inp", del_keys=False, sort=False),
-                    Mod(make_mlp([1024, 512, 512]), ["_actor_inp"], ["_actor_feature"]),
+                    Mod(make_mlp([1024, 1024, 512]), ["_actor_inp"], ["_actor_feature"]),
                     Mod(Actor(self.action_dim, init_noise_scale=init_noise_scale, load_noise_scale=self.cfg.load_noise_scale), ["_actor_feature"], ["loc", "scale"]),
                 ),
                 in_keys=["loc", "scale"],
@@ -167,7 +203,7 @@ class PPOPolicy(TensorDictModuleBase):
         # ---------------------------------------------------------------------------- critic (shared)
         self.critic = Seq(
             CatTensors([OBS_KEY, OBS_PRIV_KEY, CRITIC_PRIV_KEY], "_critic_inp", del_keys=False),
-            Mod(nn.Sequential(make_mlp([1024, 512, 512]), nn.LazyLinear(1)), ["_critic_inp"], ["state_value"]),
+            Mod(CriticNet([1024, 512, 512]), ["_critic_inp"], ["state_value"]),
         ).to(device)
 
         # ---------------------------------------------------------------------------- lazy init pass
@@ -194,46 +230,39 @@ class PPOPolicy(TensorDictModuleBase):
             self._wrap_ddp(local_rank=aa.get_local_rank())
 
         # ---------------------------------------------------------------------------- optimisers
-        self.opt_teacher = torch.optim.Adam(
-            list(self.actor_teacher.parameters()) + list(self.encoder_priv.parameters()),
-            lr=cfg.lr,
+        self.opt_teacher = build_optimizer(
+            params=list(self.actor_teacher.parameters()) + list(self.encoder_priv.parameters()),
+            optimizer=self.cfg.optimizer,
+            lr=self.cfg.actor_start_lr,
+            weight_decay=self.cfg.optimizer_weight_decay,
+            adamw_only_params=collect_adamw_only_params(
+                self._unwrap_module(self.actor_teacher), Actor, expected_modules=1
+            ),
         )
-        self.opt_student = torch.optim.Adam(
-            self.actor_student.parameters(),
-            lr=cfg.lr,
+        self.opt_student = build_optimizer(
+            params=self.actor_student.parameters(),
+            optimizer=self.cfg.optimizer,
+            lr=self.cfg.actor_start_lr,
+            weight_decay=self.cfg.optimizer_weight_decay,
+            adamw_only_params=collect_adamw_only_params(
+                self._unwrap_module(self.actor_student), Actor, expected_modules=1
+            ),
         )
-        self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
-        self.opt_estimator = torch.optim.Adam(self.adapt_module.parameters(), lr=cfg.lr)
-
-        self.update_teacher = functools.partial(
-            self._update,
-            actor=self.actor_teacher,
-            encoder=self.encoder_priv,
-            critic=self.critic,
-            opt_actor=self.opt_teacher,
-            opt_critic=self.opt_critic,
+        self.opt_critic = build_optimizer(
+            params=self.critic.parameters(),
+            optimizer=self.cfg.optimizer,
+            lr=self.cfg.critic_lr,
+            weight_decay=0.0,
+            adamw_only_params=collect_adamw_only_params(
+                self._unwrap_module(self.critic), CriticNet, expected_modules=1
+            ),
         )
-        self.update_student = functools.partial(
-            self._update,
-            actor=self.actor_student,
-            encoder=self.adapt_module,
-            critic=self.critic,
-            opt_actor=self.opt_student,
-            opt_critic=self.opt_critic,
-            update_encoder=False,
-            update_actor=True,
+        self.opt_estimator = build_optimizer(
+            params=self.adapt_module.parameters(),
+            optimizer=self.cfg.optimizer,
+            lr=self.cfg.critic_lr,
+            weight_decay=0.0,
         )
-        self.update_student_critic = functools.partial(
-            self._update,
-            actor=self.actor_student,
-            encoder=self.adapt_module,
-            critic=self.critic,
-            opt_actor=self.opt_student,
-            opt_critic=self.opt_critic,
-            update_encoder=False,
-            update_actor=False,
-        )
-        self.update2 = functools.partial(self._update2, adapt_module=self.adapt_module, opt_estimator=self.opt_estimator)
 
         self.use_symmetry_ppo = bool(getattr(self.cfg, "symmetry_enabled", True))
         aa.print(f"use_symmetry_ppo={self.use_symmetry_ppo}")
@@ -248,6 +277,9 @@ class PPOPolicy(TensorDictModuleBase):
             self.critic_priv_transform = None
             self.act_transform = None
 
+    # ------------------------------------------------------------------------------------------ #
+    # Setup Helpers
+    # ------------------------------------------------------------------------------------------ #
     def _wrap_ddp(self, local_rank: int):
         ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank,
                         broadcast_buffers=True, find_unused_parameters=False)
@@ -258,15 +290,67 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic        = DDP(self.critic,        **ddp_kwargs)
         self.adapt_module  = DDP(self.adapt_module,  **ddp_kwargs)
 
+    @staticmethod
+    def _unwrap_module(module):
+        return module.module if isinstance(module, DDP) else module
+
     def broadcast_parameters(self, extra_modules=[]):
+        info = {}
         if self.num_updates % 32 == 0:
             update_list = [self.value_norm] + extra_modules
             if aa.is_distributed():
+                info.update(self._ddp_param_consistency_info())
                 for m in update_list:
                     for p in m.parameters():
                         dist.broadcast(p, src=0)
                     for p in m.buffers():
                         dist.broadcast(p, src=0)
+        return info
+
+    @staticmethod
+    def _param_signature(module: nn.Module, device: str) -> torch.Tensor:
+        signature = torch.zeros(4, device=device, dtype=torch.float64)
+        with torch.no_grad():
+            for param in module.parameters():
+                data = param.detach().reshape(-1).to(torch.float64)
+                if not data.numel():
+                    continue
+                weights = torch.linspace(0.5, 1.5, data.numel(), device=device, dtype=torch.float64)
+                signature[0] += data.sum()
+                signature[1] += data.square().sum()
+                signature[2] = torch.maximum(signature[2], data.abs().max())
+                signature[3] += (data * weights).sum()
+        return signature
+
+    def _ddp_param_consistency_info(self) -> dict[str, float]:
+        if not aa.is_distributed():
+            return {}
+
+        modules = {
+            "actor_teacher": self.actor_teacher,
+            "actor_student": self.actor_student,
+            "encoder_priv": self.encoder_priv,
+            "critic": self.critic,
+            "adapt_module": self.adapt_module,
+        }
+        info = {}
+        max_gap = 0.0
+        for name, module in modules.items():
+            signature = self._param_signature(self._unwrap_module(module), self.device)
+            sig_max = signature.clone()
+            sig_min = signature.clone()
+            dist.all_reduce(sig_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(sig_min, op=dist.ReduceOp.MIN)
+            gap = (sig_max - sig_min).abs()
+            module_gap = float(gap.max().item())
+            max_gap = max(max_gap, module_gap)
+            info[f"ddp_param/{name}_sum_gap"] = float(gap[0].item())
+            info[f"ddp_param/{name}_sqsum_gap"] = float(gap[1].item())
+            info[f"ddp_param/{name}_absmax_gap"] = float(gap[2].item())
+            info[f"ddp_param/{name}_weighted_sum_gap"] = float(gap[3].item())
+            info[f"ddp_param/{name}_max_gap"] = module_gap
+        info["ddp_param/max_gap"] = max_gap
+        return info
 
     def _resolve_init_noise_scale(self):
         base_scale = float(self.cfg.init_noise_scale)
@@ -283,34 +367,72 @@ class PPOPolicy(TensorDictModuleBase):
             scales[idx] = float(scale)
         return scales
 
-    def do_lr_schedule(self, kl):
-        if not hasattr(self, "current_lr"):
-            self.current_lr = self.cfg.lr
-        
-        if self.progress < 0.1:
+    # ------------------------------------------------------------------------------------------ #
+    # Runtime Interface
+    # ------------------------------------------------------------------------------------------ #
+    @staticmethod
+    def _get_optimizer_lr(opt) -> float:
+        lrs = [float(group["lr"]) for group in opt.param_groups]
+        if len(lrs) == 0:
+            raise RuntimeError("optimizer has no param_groups")
+        return sum(lrs) / len(lrs)
+
+    @staticmethod
+    def _set_optimizer_lr(opt, lr: float):
+        lr = float(lr)
+        for param_group in opt.param_groups:
+            param_group["lr"] = lr
+
+    def get_lr(self, target: str | None = None):
+        lrs = {
+            "actor": 0.5 * (
+                self._get_optimizer_lr(self.opt_teacher) + self._get_optimizer_lr(self.opt_student)
+            ),
+            "critic": self._get_optimizer_lr(self.opt_critic),
+            "estimator": self._get_optimizer_lr(self.opt_estimator),
+        }
+        if target is None:
+            return lrs
+        if target not in lrs:
+            raise ValueError(f"unsupported lr target: {target}")
+        return lrs[target]
+
+    def set_lr(self, target: str, lr: float):
+        if target == "actor":
+            self._set_optimizer_lr(self.opt_teacher, lr)
+            self._set_optimizer_lr(self.opt_student, lr)
             return
+        if target == "critic":
+            self._set_optimizer_lr(self.opt_critic, lr)
+            return
+        if target == "estimator":
+            self._set_optimizer_lr(self.opt_estimator, lr)
+            return
+        raise ValueError(f"unsupported lr target: {target}")
+
+    def do_lr_schedule(self, kl):
+        schedule_progress = float(self.progress if self.cfg.phase == "train" else 1.0)
+        kl_upper = _schedule_value(self.cfg.desired_kl_upper, schedule_progress)
+        kl_lower = _schedule_value(self.cfg.desired_kl_lower, schedule_progress)
+
+        new_lr = self.get_lr("actor")
+        if kl > kl_upper:
+            new_lr = max(self.cfg.lr_schedule_min, new_lr / self.cfg.lr_schedule_scale_factor)
+        elif 0.0 < kl < kl_lower:
+            new_lr = min(self.cfg.lr_schedule_max, new_lr * self.cfg.lr_schedule_scale_factor)
 
         if aa.is_distributed():
-            kl_tensor = torch.tensor(kl, device=self.device)
-            dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
-            kl = (kl_tensor / self.world_size).item()
+            lr_tensor = torch.tensor(new_lr, device=self.device)
+            dist.all_reduce(lr_tensor, op=dist.ReduceOp.SUM)
+            new_lr = (lr_tensor / self.world_size).item()
 
-        new_lr = self.current_lr
-        if kl > self.cfg.desired_kl * 2.0:
-            new_lr = max(1e-5, new_lr / 1.1)
-        elif 0.0 < kl < self.cfg.desired_kl / 2.0:
-            new_lr = min(5e-3, new_lr * 1.1)
-
-        self.current_lr = new_lr
-
-        for opt in (self.opt_teacher, self.opt_student):
-            for param_group in opt.param_groups:
-                param_group["lr"] = self.current_lr
+        self.set_lr("actor", new_lr)
+        return kl_upper, kl_lower, schedule_progress
 
     def make_tensordict_primer(self):
         return None
 
-    def get_rollout_policy(self, mode: str = "train"):
+    def get_rollout_policy(self, mode: str = ""):
         modules = []
         if self.cfg.phase == "train":
             modules += [self.encoder_priv, self.actor_teacher]
@@ -332,84 +454,98 @@ class PPOPolicy(TensorDictModuleBase):
         self.entropy_coef = start * (end / start) ** progress
         self.progress = progress
 
+    # ------------------------------------------------------------------------------------------ #
+    # Training
+    # ------------------------------------------------------------------------------------------ #
     def train_op(self, td: TensorDict, vecnorm):
         """One optimisation step on a batched rollout tensor-dict."""
+        info = {}
         if self.cfg.phase == "train":
-            info = {}
-            info.update(self._ppo_update(td, self.update_teacher))
-            info.update(self.train_estimator(td))
+            info.update(self._train_ppo(td, mode="teacher"))
+            info.update(self._train_estimator(td))
         elif self.cfg.phase == "finetune":
-            info = {}
-            if self.progress > 0.025:
-                info.update(self._ppo_update(td, self.update_student))
-            else:
-                info.update(self._ppo_update(td, self.update_student_critic))
+            info.update(self._train_ppo(td, mode="student"))
         else:  # adapt
-            info = self.train_estimator(td)
+            info.update(self._train_estimator(td))
         self.num_updates += 1
-        self.broadcast_parameters(extra_modules=[vecnorm])
+        info.update(self.broadcast_parameters(extra_modules=[vecnorm]))
         return info
 
-    def _ppo_update(self, td, update_func: callable = None):
+    # ------------------------------------------------------------------------------------------ #
+    # Minibatch Preparation
+    # ------------------------------------------------------------------------------------------ #
+    def _prepare_mb(self, mb: TensorDict, include_adv_ret: bool, apply_symmetry: bool = False) -> tuple[TensorDict, torch.Tensor]:
+        keys = [OBS_KEY, OBS_PRIV_KEY, CRITIC_PRIV_KEY, "is_init"]
+        if include_adv_ret:
+            keys.extend(["adv", "ret"])
+        mb = mb.select(*keys)
+        if apply_symmetry and self.use_symmetry_ppo:
+            mb_sym = mb.clone()
+            mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
+            mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
+            mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
+            mb = torch.cat([mb, mb_sym], dim=0)
+        valid = ~mb["is_init"]
+        return mb, valid
+
+    # ------------------------------------------------------------------------------------------ #
+    # PPO Update
+    # ------------------------------------------------------------------------------------------ #
+    def _train_ppo(self, td, mode: str):
         infos = []
-        self._compute_advantage(td, self.critic, self.gae, self.value_norm, 
-                               REWARD_KEY=REWARD_KEY, TERM_KEY=TERM_KEY, DONE_KEY=DONE_KEY)
-        self._modewise_adv_norm(td)
+        self._compute_advantage(td, self.critic, self.gae, self.value_norm, REWARD_KEY=REWARD_KEY, TERM_KEY=TERM_KEY, DONE_KEY=DONE_KEY)
+        adv_normalize(td["adv"], ~td["is_init"])
 
         for _ in range(self.cfg.ppo_epochs):
             for mb in make_batch(td, self.num_minibatches):
-                infos.append(TensorDict(update_func(mb), []))
+                infos.append(TensorDict(self._update_ppo_batch(mb, mode=mode), []))
         info = {k: v.mean().item() for k, v in torch.stack(infos).items()}
 
         with torch.no_grad():
-            actor = self.actor_teacher if self.cfg.phase == "train" else self.actor_student
-            base = actor.module if isinstance(actor, DDP) else actor
-            action_std = base.module[0][2].module.actor_std.detach()
+            actor = self.actor_teacher if mode == "teacher" else self.actor_student
+            action_std = self._get_actor_std(actor)
+            if action_std is None:
+                raise RuntimeError("failed to locate actor_std for logging")
             for joint_name, std in zip(self.joint_names, action_std):
                 info[f"actor_std/{joint_name}"] = std
             info["actor_std/mean"] = action_std.mean()
 
         kl = info["actor/kl"]
-        self.do_lr_schedule(kl)
-        info["lr"] = self.current_lr
+        kl_upper, kl_lower, kl_schedule_progress = self.do_lr_schedule(kl)
+        lrs = self.get_lr()
+        info["lr"] = lrs["actor"]
+        info["lr/actor"] = lrs["actor"]
+        info["lr/critic"] = lrs["critic"]
+        info["lr/estimator"] = lrs["estimator"]
+        info["lr/kl_upper"] = torch.tensor(kl_upper, device=self.device)
+        info["lr/kl_lower"] = torch.tensor(kl_lower, device=self.device)
+        info["lr/kl_schedule_progress"] = torch.tensor(kl_schedule_progress, device=self.device)
 
         neg_reward_ratio = (td[REWARD_KEY] <= 0.0).float().mean().item()
         info["critic/neg_reward_ratio"] = neg_reward_ratio
 
         return info
 
-    def _update(
-        self,
-        mb,
-        actor=None,
-        encoder=None,
-        critic=None,
-        opt_actor=None,
-        opt_critic=None,
-        update_actor: bool = True,
-        update_encoder: bool = True,
-    ):
-        bsize = mb.shape[0]
-        loc_old, scale_old = mb["loc"].clone(), mb["scale"].clone()
-        action_old = mb["action"].clone()
-        logp_old = mb["action_log_prob"].clone()
-
-        if self.use_symmetry_ppo:
-            mb_sym = mb.clone()
-            mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
-            mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
-            mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
-            mb_sym["adv"] = mb["adv"]
-            mb_sym["ret"] = mb["ret"]
-            mb_sym["is_init"] = mb["is_init"]
-
-            mb_sym = mb_sym.exclude("next")
-            mb = mb.exclude("next")
-            mb = torch.cat([mb, mb_sym], dim=0)
+    def _update_ppo_batch(self, mb, mode: str):
+        if mode == "teacher":
+            actor = self.actor_teacher
+            encoder = self.encoder_priv
+            update_encoder = True
+            opt_actor = self.opt_teacher
+        elif mode == "student":
+            actor = self.actor_student
+            encoder = self.adapt_module
+            update_encoder = False
+            opt_actor = self.opt_student
         else:
-            mb = mb.exclude("next")
-        valid = ~mb["is_init"]
-        mb = mb.exclude("action_log_prob", "action")
+            raise ValueError(f"unsupported ppo mode: {mode}")
+
+        bsize = mb.shape[0]
+        loc_old, scale_old = mb["loc"], mb["scale"]
+        action_old = mb["action"]
+        logp_old = mb["action_log_prob"]
+
+        mb, valid = self._prepare_mb(mb, include_adv_ret=True, apply_symmetry=True)
 
         if encoder is not None:
             if update_encoder:
@@ -417,12 +553,8 @@ class PPOPolicy(TensorDictModuleBase):
             else:
                 with torch.no_grad():
                     encoder(mb)
-        
-        if update_actor:
-            actor(mb)
-        else:
-            with torch.no_grad():
-                actor(mb)
+
+        actor(mb)
 
         dist = IndependentNormal(mb["loc"][:bsize], mb["scale"][:bsize])
         logp = dist.log_prob(action_old)
@@ -434,7 +566,7 @@ class PPOPolicy(TensorDictModuleBase):
         policy_loss = - torch.mean(torch.min(surr1, surr2) * valid[:bsize])
         entropy_loss = - self.entropy_coef * entropy
 
-        values = critic(mb)["state_value"]
+        values = self.critic(mb)["state_value"]
         value_loss = F.mse_loss(mb["ret"], values, reduction="none")
         value_loss = (value_loss * valid).mean(dim=0)
 
@@ -446,7 +578,7 @@ class PPOPolicy(TensorDictModuleBase):
             reg_loss = self.reg_lambda * torch.mean(reg_loss * valid)
         else:
             reg_loss = 0.0
-        
+
         if self.use_symmetry_ppo:
             symmetry_loss_loc = F.mse_loss(mb["loc"][:bsize], self.act_transform(mb["loc"][bsize:])) * 0.2
             symmetry_loss_std = F.mse_loss(
@@ -461,25 +593,22 @@ class PPOPolicy(TensorDictModuleBase):
 
         # do optimisation step
         opt_actor.zero_grad()
-        opt_critic.zero_grad()
+        self.opt_critic.zero_grad()
 
         loss.backward()
 
-        if update_encoder and update_actor and encoder is not None:
+        if update_encoder and encoder is not None:
             encoder_grad_norm = nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
         else:
             encoder_grad_norm = torch.tensor(0.0, device=self.device)
 
-        if update_actor:
-            actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-            opt_actor.step()
-            self._clamp_actor_std(actor)
-        else:
-            actor_grad_norm = torch.tensor(0.0, device=self.device)
+        actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+        opt_actor.step()
+        self._clamp_actor_std(actor)
 
-        critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+        critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
 
-        opt_critic.step()
+        self.opt_critic.step()
 
         with torch.no_grad():
             explained_var = 1 - value_loss / (mb["ret"] * valid).var(dim=0)
@@ -507,56 +636,52 @@ class PPOPolicy(TensorDictModuleBase):
 
         info["critic/explained_var"] = explained_var.mean().detach()
         info["critic/value_loss"] = value_loss.mean().detach()
-    
+
         return info
 
-    def _clamp_actor_std(self, actor):
-        base = actor.module if isinstance(actor, DDP) else actor
-        actor_std = None
+    # ------------------------------------------------------------------------------------------ #
+    # Actor Utils
+    # ------------------------------------------------------------------------------------------ #
+    def _get_actor_std(self, actor):
+        base = self._unwrap_module(actor)
         for module in base.modules():
             if isinstance(module, Actor) and hasattr(module, "actor_std"):
-                actor_std = module.actor_std
-                break
+                return module.actor_std
+        return None
+
+    def _clamp_actor_std(self, actor):
+        actor_std = self._get_actor_std(actor)
         if actor_std is None:
             return
         actor_std.data = torch.minimum(actor_std.data, self._init_noise_scale_max)
 
-    def train_estimator(self, td):
+    # ------------------------------------------------------------------------------------------ #
+    # Estimator Update
+    # ------------------------------------------------------------------------------------------ #
+    def _train_estimator(self, td):
         infos = []
         
         for _ in range(2):
             for mb in make_batch(td, self.num_minibatches, self.cfg.train_every):
-                infos.append(TensorDict(self.update2(mb), []))
+                mb, valid = self._prepare_mb(mb, include_adv_ret=False, apply_symmetry=True)
+
+                with torch.no_grad():
+                    self.encoder_priv(mb)
+                self.adapt_module(mb)
+
+                loss = torch.mean(F.mse_loss(mb["priv_pred"], mb["priv_feature"], reduction="none") * (valid))
+
+                self.opt_estimator.zero_grad()
+                loss.backward()
+                self.opt_estimator.step()
+
+                infos.append(TensorDict({"adapt/estimator_loss": loss.detach()}, []))
 
         return {k: v.mean().item() for k, v in torch.stack(infos).items()}
 
-    def _update2(self, mb, adapt_module, opt_estimator):
-        if self.use_symmetry_ppo:
-            mb_sym = mb.clone()
-            mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
-            mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
-            mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
-            mb_sym["is_init"] = mb["is_init"]
-
-            mb_sym = mb_sym.exclude("next")
-            mb = mb.exclude("next")
-            mb = torch.cat([mb, mb_sym], dim=0)
-        else:
-            mb = mb.exclude("next")
-
-        with torch.no_grad():
-            self.encoder_priv(mb)
-        adapt_module(mb)
-
-        valid = ~mb["is_init"]
-        loss = torch.mean(F.mse_loss(mb["priv_pred"], mb["priv_feature"], reduction="none") * (valid))
-
-        opt_estimator.zero_grad()
-        loss.backward()
-        opt_estimator.step()
-
-        return {"adapt/estimator_loss": loss.detach()}
-
+    # ------------------------------------------------------------------------------------------ #
+    # Statistics
+    # ------------------------------------------------------------------------------------------ #
     @staticmethod
     @torch.compile
     @torch.no_grad()
@@ -583,55 +708,18 @@ class PPOPolicy(TensorDictModuleBase):
         value_norm.update(ret)
         td["adv"], td["ret"] = adv, value_norm.normalize(ret)
 
-    @staticmethod
-    @torch.compile
-    def get_global_mean_std(x: torch.Tensor, mask: torch.Tensor):
-        if aa.is_distributed():
-            local_count = mask.sum()
-
-            local_sum = (x * mask).sum()
-            local_sum_sq = (x * x * mask).sum()
-
-            stats = torch.stack([local_sum, local_sum_sq, local_count.float()])
-
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-
-            global_sum, global_sum_sq, global_count = stats
-            global_count.clamp_min_(1)
-
-            global_mean = global_sum / global_count
-            global_var = (global_sum_sq / global_count) - (global_mean * global_mean)
-            global_std = torch.sqrt(global_var.clamp(min=0.0)).clamp(min=1e-5)
-        else:
-            count = mask.sum().clamp_min_(1)
-            sum = (x * mask).sum()
-            sum_sq = (x * x * mask).sum()
-
-            global_mean = sum / count
-            global_var = (sum_sq / count) - (global_mean * global_mean)
-            global_std = torch.sqrt(global_var.clamp(min=0.0)).clamp(min=1e-5)
-        return global_mean, global_std
-
-    def _modewise_adv_norm(self, td):
-        adv = td["adv"]
-        is_init = td["is_init"]
-        
-        mask = ~is_init
-        mean_mode, std_mode = self.get_global_mean_std(adv, mask)
-        adv[mask] = (adv[mask] - mean_mode) / std_mode
-
+    # ------------------------------------------------------------------------------------------ #
+    # Checkpoint IO
+    # ------------------------------------------------------------------------------------------ #
     def state_dict(self):
         state = OrderedDict()
         for n, m in self.named_children():
-            if isinstance(m, DDP):
-                state[n] = m.module.state_dict()
-            else:
-                state[n] = m.state_dict()
+            state[n] = self._unwrap_module(m).state_dict()
 
         state["last_phase"] = self.cfg.phase
 
         state["_meta"] = {
-            "current_lr": getattr(self, "current_lr", self.cfg.lr),
+            "lrs": self.get_lr(),
             "entropy_coef": getattr(self, "entropy_coef", self.cfg.entropy_coef_start),
             "reg_lambda": getattr(self, "reg_lambda", 0.0),
             "progress": getattr(self, "progress", 0.0),
@@ -644,10 +732,7 @@ class PPOPolicy(TensorDictModuleBase):
     def load_state_dict(self, state_dict, strict=True):
         for n, m in self.named_children():
             try:
-                if isinstance(m, DDP):
-                    m.module.load_state_dict(state_dict.get(n, {}), strict=strict)
-                else:
-                    m.load_state_dict(state_dict.get(n, {}), strict=strict)
+                self._unwrap_module(m).load_state_dict(state_dict.get(n, {}), strict=strict)
             except Exception as e:
                 warnings.warn(f"Failed to load {n}: {e}")
 
@@ -656,31 +741,17 @@ class PPOPolicy(TensorDictModuleBase):
         # Initialize student actor from teacher if starting from a 'train' phase checkpoint
         if last_phase == "train":
             warnings.warn("Last phase was 'train'. Performing a hard copy from `actor_teacher` to `actor_student`.")
-            self.hard_copy_(self.actor_teacher, self.actor_student)
+            src = self._unwrap_module(self.actor_teacher)
+            dst = self._unwrap_module(self.actor_student)
+            hard_copy_(src, dst)
 
         meta = state_dict.get("_meta", {})
+        saved_lrs = meta.get("lrs", None)
+        if saved_lrs is not None:
+            for target, lr in saved_lrs.items():
+                self.set_lr(target, lr)
         if state_dict["last_phase"] == self.cfg.phase:
-            self.current_lr   = meta.get("current_lr", getattr(self, "current_lr", self.cfg.lr))
             self.entropy_coef = meta.get("entropy_coef", self.entropy_coef)
             self.reg_lambda   = meta.get("reg_lambda", self.reg_lambda)
             self.progress     = meta.get("progress", self.progress)
             self.num_updates  = meta.get("num_updates", self.num_updates)
-
-    @staticmethod
-    def soft_copy_(src_module: nn.Module, dst_module: nn.Module, tau: float):
-        src = src_module.module if isinstance(src_module, DDP) else src_module
-        dst = dst_module.module if isinstance(dst_module, DDP) else dst_module
-
-        with torch.no_grad():
-            src_params = dict(src.named_parameters())
-            for name, dst_param in dst.named_parameters():
-                if name in src_params:
-                    src_param = src_params[name]
-                    # The requires_grad status of dst_param is maintained
-                    dst_param.data.copy_(
-                        tau * src_param.data + (1.0 - tau) * dst_param.data
-                    )
-    
-    @staticmethod
-    def hard_copy_(src_module: nn.Module, dst_module: nn.Module):
-        PPOPolicy.soft_copy_(src_module, dst_module, 1.0)

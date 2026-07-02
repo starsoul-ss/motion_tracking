@@ -1,0 +1,151 @@
+tracking_name: L7TRACKING
+name: xbot_l7
+mass: 64.555507
+
+body:
+  base_pattern: pelvis
+  torso_pattern: torso_link
+  head_pattern: head_mimic
+  hand_pattern: .*_hand_mimic
+  feet_pattern: .*ankle_roll_link
+  feet_toe_pattern: .*ankle_roll_toe_link
+
+action:
+  action_scaling:
+    .*elbow.*: 1.0
+    .*shoulder.*: 1.0
+    .*arm_yaw.*: 1.0
+    .*wrist.*: 1.0
+    .*hip_roll.*: 0.5
+    .*hip_yaw.*: 0.5
+    .*hip_pitch.*: 0.5
+    .*knee.*: 0.5
+    .*waist.*: 0.5
+    .*ankle.*: 0.5
+  max_delay: 2
+  torque_limit_scale_range: [4.0, 1.0]
+  torque_limit_progress_range: [0.0, 0.8]
+  boot_delay_steps: 3
+
+command:
+  required_motion_body_patterns: ["pelvis", ".*torso.*", "head_mimic", ".*_hand_mimic", ".*elbow_pitch_link", ".*shoulder_roll_link", ".*hip_yaw_link", ".*knee.*", ".*ankle_roll_link"]
+  keypoint_patterns: ["head_mimic", ".*_hand_mimic", ".*elbow_pitch_link", ".*shoulder_roll_link", ".*hip_yaw_link", ".*knee.*", ".*ankle_roll_link"]
+  feet_standing:
+    z_enter: 0.18
+    z_exit: 0.25
+    vxy_enter: 0.2
+    vxy_exit: 0.3
+    vz_enter: 0.15
+    vz_exit: 0.25
+  dataset:
+    skip_initial_frames: 5
+    groups:
+      - name: lafan
+        teacher_mem_path: l7/lafan
+        weight: 0.3
+      - name: style100
+        teacher_mem_path: l7/100style
+        weight: 0.3
+      - name: seed
+        teacher_mem_path: l7/seed/all
+        weight: 0.3
+      ## PMG paired dataset. If PMG is enabled, keep student_motion_randomization disabled.
+      ## If PMG data is unavailable, comment this group out and enable student_motion_randomization instead.
+      # - name: vr_paired
+      #   teacher_mem_path: l7/vr_paired/clean
+      #   student_mem_path: l7/vr_paired/raw
+      #   weight: 0.1
+    offset_pos_z: 0.0
+    cache_request_range: [-20, 24]
+    cache_fill_range: [-20, 100]
+  student_future_steps: [0, 1, 2, 3, 4, 6, 8, 10, 12, 16, -1, -2, -4, -8]
+  reinit_prob: 0.5
+  student_motion_randomization:
+    # Enable this motion DR only when PMG paired data is not used.
+    enable: true
+    root_pos_noise_std: 0.005
+    root_ori_noise_std: 0.02
+    joint_pos_noise_std: 0.01
+    joint_pos_bias_std:
+      ".*(shoulder|elbow|wrist|waist).*": 0.0
+      ".*(hip|knee|ankle).*": 0.1
+    root_pos_drift:
+      root_z_offset_range_m: [-0.05, 0.05]
+      xy_speed_range: [0.0, 0.2]
+      xy_freq_range_hz: [0.25, 1.0]
+      z_amplitude_range_m: [0.0, 0.025]
+      z_freq_range_hz: [0.25, 1.0]
+    root_rot_drift:
+      amplitude_range_rad: [0.0, 0.1]
+      freq_range_hz: [0.25, 1.0]
+  shared_joint_pos:
+    std:
+      ".*": 0.02
+    bias:
+      ".*": 0.0
+  shared_joint_vel:
+    std:
+      ".*": 0.75
+
+observation:
+  policy:
+    noise:
+      command_obs: 0.1
+      root_angvel_history: 0.2
+      projected_gravity_history: 0.01
+      projected_gravity_history_bias: 0.03
+      joint_pos_history: 0.02
+      joint_vel_history: 0.75
+
+randomization:
+  motor_params_implicit:
+    mode: uniform
+    stiffness_range:
+      ".*(shoulder|arm_yaw|elbow|wrist).*": [0.95, 1.05]
+      ".*(waist_yaw|hip|knee).*": [0.95, 1.05]
+      ".*(waist_roll|waist_pitch|ankle).*": [0.7, 1.3]
+    damping_range:
+      ".*(shoulder|arm_yaw|elbow|wrist).*": [0.95, 1.05]
+      ".*(waist_yaw|hip|knee).*": [0.95, 1.05]
+      ".*(waist_roll|waist_pitch|ankle).*": [0.7, 1.3]
+    armature_range:
+      ".*(shoulder|arm_yaw|elbow|wrist).*": [0.95, 1.05]
+      ".*(waist_yaw|hip|knee).*": [0.95, 1.05]
+      ".*(waist_roll|waist_pitch|ankle).*": [0.7, 1.3]
+    frictionloss_range:
+      ".*(shoulder|elbow_pitch|elbow_yaw|wrist|waist).*": [2.0, 6.0]
+      ".*(arm_yaw).*": [5.0, 10.0]
+  random_joint_offset:
+    .*: [-0.02, 0.02]
+  perturb_root_vel:
+    min_s: 4.0
+    max_s: 6.0
+    x: [-0.5, 0.5]
+    y: [-0.5, 0.5]
+    z: [-0.2, 0.2]
+    roll: [-0.52, 0.52]
+    pitch: [-0.52, 0.52]
+    yaw: [-0.78, 0.78]
+  perturb_body_wrench:
+    body_name: ${task.profile.body.torso_pattern}
+    total_duration_range_s: [3.0, 6.0]
+    active_duration_range_s: [1.0, 4.0]
+    force_magnitude_range_n: [0.0, 20.0]
+    lever_arm_length_range_m: [0.0, 0.4]
+  window_cap_hand_load:
+    enabled: false
+  perturb_body_materials:
+    body_names: .*
+    static_friction_range: [0.5, 1.2]
+    solref_time_constant_range: [0.015, 0.03]
+    solref_dampratio_range: [0.8, 1.2]
+
+reward:
+  feet_air_time_ref_dense:
+    air_h_low: 0.035
+    air_h_high: 0.155
+    contact_h_low: 0.035
+    contact_h_high: 0.125
+
+termination:
+  body_z_terminate_thres: [-0.3, 0.35]

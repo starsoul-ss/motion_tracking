@@ -1,0 +1,212 @@
+# @package task
+name: ${task.profile.tracking_name}
+
+robot:
+  name: ${task.profile.name}
+  mass: ${task.profile.mass}
+
+action:
+  _target_: active_adaptation.envs.mdp.action.JointPosition
+  action_scaling: ${task.profile.action.action_scaling}
+  alpha: [0.8, 1.0]
+  prev_action_obs: mean
+  action_rate_source: sampled
+  max_delay: ${task.profile.action.max_delay}
+  delay_full_progress: 0.8
+  torque_limit_scale_range: ${oc.select:task.profile.action.torque_limit_scale_range,[1.0, 1.0]}
+  torque_limit_progress_range: ${oc.select:task.profile.action.torque_limit_progress_range,[0.0, 1.0]}
+  boot_protect: true
+  boot_delay_steps: ${task.profile.action.boot_delay_steps}
+
+flags: []
+
+command:
+  _target_: active_adaptation.envs.mdp.commands.MotionTrackingCommand
+  required_motion_body_patterns: ${task.profile.command.required_motion_body_patterns}
+  keypoint_patterns: ${task.profile.command.keypoint_patterns}
+  feet_patterns:
+    - ${task.profile.body.feet_pattern}
+  feet_standing: ${task.profile.command.feet_standing}
+  dataset: ${task.profile.command.dataset}
+  dataset_extra_keys: []
+  future_steps: [0, 1, 2, 4, 8, 12, 16, 20, -1, -2, -4, -8]
+  student_future_steps: ${task.profile.command.student_future_steps}
+  reinit_prob: ${task.profile.command.reinit_prob}
+  reinit_min_steps: 25
+  reinit_max_steps: 75
+  boot_indicator_max: 25
+  student_motion_randomization: ${task.profile.command.student_motion_randomization}
+  shared_joint_pos:
+    std: ${oc.select:task.profile.command.shared_joint_pos.std,${task.profile.observation.policy.noise.joint_pos_history}}
+    bias: ${oc.select:task.profile.command.shared_joint_pos.bias,0.0}
+  shared_joint_vel:
+    std: ${oc.select:task.profile.command.shared_joint_vel.std,${task.profile.observation.policy.noise.joint_vel_history}}
+  init_noise:
+    root_pos: 0.03
+    root_ori: 0.1
+    root_lin_vel: 0.1
+    root_ang_vel: 0.1
+    joint_pos: 0.1
+    joint_vel: 0.1
+
+observation:
+  policy:
+    boot_indicator_state_obs: {}
+    command_obs:
+      noise_std: ${task.profile.observation.policy.noise.command_obs}
+    target_joint_pos_obs:
+      noise_std: ${task.profile.observation.policy.noise.joint_pos_history}
+      horizon: student
+    target_root_z_obs:
+      horizon: student
+    target_projected_gravity_b_obs:
+      horizon: student
+
+    root_angvel_b_history:
+      history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
+      noise_std: ${task.profile.observation.policy.noise.root_angvel_history}
+    # root_linacc_b_history:
+    #   history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
+    #   noise_std: 0.2
+    #   bias_noise_std: 0.2
+    projected_gravity_history:
+      history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
+      noise_std: ${task.profile.observation.policy.noise.projected_gravity_history}
+      bias_noise_std: ${task.profile.observation.policy.noise.projected_gravity_history_bias}
+
+    joint_pos_history:
+      history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
+      noise_std: ${task.profile.observation.policy.noise.joint_pos_history}
+    joint_vel_history:
+      history_steps: [0, 1, 2, 3, 4, 8, 12, 16, 20]
+      noise_std: ${task.profile.observation.policy.noise.joint_vel_history}
+
+    prev_actions:   {steps: 8}
+  priv:
+    # tracking
+    target_joint_pos_obs: {horizon: teacher}
+    target_root_z_obs: {horizon: teacher}
+    target_projected_gravity_b_obs: {horizon: teacher}
+    target_pos_b_obs: {}
+    target_rot_b_obs: {}
+    target_linvel_b_obs: {}
+    target_angvel_b_obs: {}
+    # bodies
+    current_keypoint_pos_b_obs: {}
+    current_keypoint_rot_b_obs: {}
+    current_keypoint_linvel_b_obs: {}
+    current_keypoint_angvel_b_obs: {}
+    target_keypoints_pos_b_obs: {required_steps: 12, include_diff: true}
+    target_keypoints_rot_b_obs: {required_steps: 12, include_diff: true}
+    # target_keypoints_linvel_b_obs: {required_steps: 4, include_diff: true}
+    # target_keypoints_angvel_b_obs: {required_steps: 4, include_diff: true}
+    # root
+    root_linvel_b_history:     {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    root_angvel_b_history:     {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    projected_gravity_history: {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0, bias_noise_std: 0.0}
+    # joint
+    joint_pos_history:         {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    joint_vel_history:         {history_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8], noise_std: 0.0}
+    applied_action: {}
+    applied_torque: {}
+    # termination hints
+    body_z_termination_obs:
+      body_z_terminate_patterns:
+        - ${task.profile.body.base_pattern}
+        - ${oc.select:task.profile.body.head_pattern,__no_head_pattern__}
+        - ${task.profile.body.hand_pattern}
+        - ${task.profile.body.feet_pattern}
+    gravity_dir_termination_obs: {}
+    # feet & support
+    feet_contact_state:
+      body_names:
+        - ${task.profile.body.feet_pattern}
+    target_feet_contact_state_obs: {}
+  priv_critic:
+    domain_motor_params_implicit: {}
+    domain_perturb_body_materials: {}
+    domain_random_joint_offset: {}
+    domain_perturb_gravity: {}
+
+reward:
+  tracking:
+    root_pos_tracking:     {weight: 0.5, sigma: [0.3]}
+    root_rot_tracking:     {weight: 0.5, sigma: [0.4]}
+    root_vel_tracking:     {weight: 1.0, sigma: [1.0]}
+    root_ang_vel_tracking: {weight: 1.0, sigma: [3.0]}
+
+    keypoint_pos_tracking:    {weight: 2.0, sigma: [0.3]}
+    keypoint_vel_tracking:    {weight: 1.0, sigma: [1.0]}
+    keypoint_rot_tracking:    {weight: 2.0, sigma: [0.4]}
+    keypoint_angvel_tracking: {weight: 1.0, sigma: [3.0]}
+
+    joint_pos_tracking:    {weight: 1.0, sigma: [0.5]}
+    joint_vel_tracking:    {weight: 0.5, sigma: [3.0]}
+  loco:
+    survival:           {weight: 3.0, enabled: true}
+    # impact_force_l2:    {weight: 4.0, enabled: true, body_names: ${task.profile.body.feet_pattern}}
+    # feet_slip:          {weight: 2.0, enabled: true, body_names: ${task.profile.body.feet_pattern}}
+    joint_vel_l2:       {weight: 5.0e-4, enabled: true, joint_names: .*}
+    action_rate_l2:     {weight: 0.02, enabled: true}
+    feet_air_time_ref:
+      weight: 5.0
+      enabled: true
+      body_names: ${task.profile.body.feet_pattern}
+      thres: 0.5
+    feet_air_time_ref_dense:
+      weight: 1.0
+      enabled: true
+      body_names: ${task.profile.body.feet_pattern}
+      body2_names: ${task.profile.body.feet_toe_pattern}
+      air_h_low: ${task.profile.reward.feet_air_time_ref_dense.air_h_low}
+      air_h_high: ${task.profile.reward.feet_air_time_ref_dense.air_h_high}
+      contact_h_low: ${task.profile.reward.feet_air_time_ref_dense.contact_h_low}
+      contact_h_high: ${task.profile.reward.feet_air_time_ref_dense.contact_h_high}
+    joint_pos_limits:   {weight: 1.0, joint_names: ".*", soft_factor: 0.9, enabled: true}
+    joint_torque_limits: {weight: 0.01, joint_names: ".*", soft_factor: 0.75, enabled: true}
+    feet_contact_count:
+      weight: 1.0
+      enabled: false
+      body_names: ${task.profile.body.feet_pattern}
+
+randomization:
+  perturb_body_com:
+    body_names:
+      - ${task.profile.body.base_pattern}
+      - ${task.profile.body.torso_pattern}
+    com_range: [-0.03, 0.03]
+  # perturb_body_mass:
+  #   ${task.profile.body.base_pattern}: [0.9, 1.1]
+  #   ${task.profile.body.torso_pattern}: [0.9, 1.1]
+  perturb_body_materials:
+    body_names: ${oc.select:task.profile.randomization.perturb_body_materials.body_names,${task.profile.body.feet_pattern}}
+    static_friction_range: ${task.profile.randomization.perturb_body_materials.static_friction_range}
+    solref_time_constant_range: ${task.profile.randomization.perturb_body_materials.solref_time_constant_range}
+    solref_dampratio_range: ${task.profile.randomization.perturb_body_materials.solref_dampratio_range}
+    homogeneous: true
+  motor_params_implicit: ${task.profile.randomization.motor_params_implicit}
+  random_joint_offset: ${task.profile.randomization.random_joint_offset}
+  perturb_root_vel: ${task.profile.randomization.perturb_root_vel}
+  perturb_body_wrench: ${task.profile.randomization.perturb_body_wrench}
+  window_cap_hand_load: ${task.profile.randomization.window_cap_hand_load}
+  perturb_gravity:
+    mean: [0.0, 0.0, -9.81]
+    std: 0.1
+
+termination:
+  episode_timeout:
+    termination_type: truncated
+  motion_timeout:
+    termination_type: truncated
+  motion_xy_range_termination:
+    termination_type: truncated
+    motion_xy_max_offset: 15.0
+  body_z_termination:
+    body_z_terminate_thres: ${task.profile.termination.body_z_terminate_thres}
+    body_z_terminate_patterns:
+      - ${task.profile.body.base_pattern}
+      - ${oc.select:task.profile.body.head_pattern,__no_head_pattern__}
+      - ${task.profile.body.hand_pattern}
+      - ${task.profile.body.feet_pattern}
+  gravity_dir_termination:
+    gravity_terminate_thres: 1.0

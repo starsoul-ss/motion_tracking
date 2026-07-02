@@ -1,12 +1,13 @@
 import os
-from .humanoid import G1_CFG, G1_COL_FULL, G1_COL_FULL_SELF
+from .g1 import G1_CFG, G1_CFG_5
+from .xbot_l7 import XBOT_L7_CFG
 
 ASSET_PATH = os.path.dirname(__file__)
 
 ROBOTS = {
     "g1": G1_CFG,
-    "g1_col_full": G1_COL_FULL,
-    "g1_col_full_self": G1_COL_FULL_SELF,
+    "g1_5": G1_CFG_5,
+    "xbot_l7": XBOT_L7_CFG,
 }
 
 

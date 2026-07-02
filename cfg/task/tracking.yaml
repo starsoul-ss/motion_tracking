@@ -1,0 +1,7 @@
+# @package task
+
+defaults:
+  - /task/common/base
+  - /task/common/tracking_base
+  - /task/profile@profile: G1_tracking
+  - _self_

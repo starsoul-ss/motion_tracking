@@ -23,11 +23,10 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.distributed as dist
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModuleBase as ModBase
-from torchrl.modules import ProbabilisticActor
-from torchrl.data import Composite
+import active_adaptation as aa
 
 
 OBS_KEY = "policy" # ("agents", "observation")
@@ -60,30 +59,6 @@ def make_mlp(num_units, activation=nn.Mish, norm="before", dropout=0.):
     return nn.Sequential(*layers)
 
 
-def make_conv(num_channels, activation=nn.LeakyReLU, kernel_sizes=3, flatten: bool=True):
-    layers = []
-    if isinstance(kernel_sizes, int):
-        kernel_sizes = [kernel_sizes] * len(num_channels)
-    for n, k in zip(num_channels, kernel_sizes):
-        layers.append(nn.LazyConv2d(n, kernel_size=k, stride=2, padding=k//2))
-        layers.append(activation())
-    if flatten:
-        layers.append(nn.Flatten())
-    return FlattenBatch(nn.Sequential(*layers), data_dim=3)
-
-
-class FlattenBatch(nn.Module):
-    def __init__(self, module, data_dim: int=1):
-        super().__init__()
-        self.module = module
-        self.data_dim = data_dim
-
-    def forward(self, input: torch.Tensor):
-        batch_shape = input.shape[:-self.data_dim]
-        output = self.module(input.flatten(0, len(batch_shape)-1))
-        return output.unflatten(0, batch_shape)
-
-
 def make_batch(tensordict: TensorDict, num_minibatches: int, seq_len: int = -1):
     if seq_len > 1:
         N, T = tensordict.shape
@@ -104,49 +79,41 @@ def make_batch(tensordict: TensorDict, num_minibatches: int, seq_len: int = -1):
         for indices in perm:
             yield tensordict[indices].clone()
 
-def make_batch_sequential(
-    tensordict: TensorDict,
-    num_minibatches: int,
-    seq_len: int = -1,
+
+def unique_trainable_params(params):
+    result = []
+    seen = set()
+    for p in params:
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        result.append(p)
+    return result
+
+def collect_adamw_only_params(
+    module: nn.Module,
+    owner_type: type[nn.Module],
+    *,
+    expected_modules: int | None = None,
 ):
-    if seq_len > 1:
-        N, T = tensordict.shape
-        T = (T // seq_len) * seq_len
-        tensordict  = tensordict[:, :T].reshape(-1, seq_len)
-    else:
-        tensordict  = tensordict.reshape(-1)
-
-    batch_size = tensordict.shape[0] // num_minibatches
-
-    for i in range(num_minibatches):
-        start = i * batch_size
-        end   = start + batch_size
-        yield tensordict[start:end].clone()
-
-
-class Chunk(nn.Module):
-    def __init__(self, n) -> None:
-        super().__init__()
-        self.n = n
-    
-    def forward(self, x):
-        return x.chunk(self.n, dim=-1)
-
-class Duplicate(nn.Module):
-    def __init__(self, n) -> None:
-        super().__init__()
-        self.n = n
-    
-    def forward(self, x):
-        return tuple(x for _ in range(self.n))
-
-class Split(nn.Module):
-    def __init__(self, split_size):
-        super().__init__()
-        self.split_size = split_size
-    
-    def forward(self, x: torch.Tensor):
-        return x.split(self.split_size, dim=-1)
+    params = []
+    tagged_modules = 0
+    for submodule in module.modules():
+        if not isinstance(submodule, owner_type):
+            continue
+        getter = getattr(submodule, "adamw_only_parameters", None)
+        if not callable(getter):
+            raise RuntimeError(f"{owner_type.__name__} must implement adamw_only_parameters()")
+        tagged_modules += 1
+        params.extend(getter())
+    if expected_modules is not None and tagged_modules != expected_modules:
+        raise RuntimeError(
+            f"expected {expected_modules} {owner_type.__name__} module(s), found {tagged_modules}"
+        )
+    return unique_trainable_params(params)
 
 
 class Actor(nn.Module):
@@ -192,26 +159,27 @@ class Actor(nn.Module):
             print("scale actor noise std by config factor")
             self.actor_std.data.mul_(self.load_noise_scale)
 
+    def adamw_only_parameters(self):
+        return self.actor_mean.parameters()
 
-class ActorCov(nn.Module):
-    """
-    Predicts state-dependent covariance between a_t and a_{t-1}.
-    """
-    def __init__(self, action_dim: int) -> None:
-        super().__init__()
-        self.actor_mean_cov = nn.LazyLinear(action_dim * 2)
-        self.actor_std = nn.Parameter(torch.zeros(action_dim))
-        self.scale_mapping = torch.exp
-    
-    def forward(self, features: torch.Tensor, prev_action: torch.Tensor, prev_loc: torch.Tensor):
-        loc, cov = self.actor_mean_cov(features).chunk(2, dim=-1)
-        scale = torch.ones_like(loc) * self.scale_mapping(self.actor_std)
-        var = scale.square()
-        cov = torch.tanh(cov) * var.detach()
-        loc = loc + (cov / var.detach()) * (prev_action - prev_loc)
-        var = var - cov.square() / var.detach()
-        scale = var.sqrt()
-        return loc, scale
+
+class CriticNet(nn.Sequential):
+    def __init__(self, hidden_units) -> None:
+        super().__init__(
+            make_mlp(hidden_units),
+            nn.LazyLinear(1),
+        )
+
+    @property
+    def backbone(self):
+        return self[0]
+
+    @property
+    def head(self):
+        return self[1]
+
+    def adamw_only_parameters(self):
+        return self.head.parameters()
 
 
 class GAE(nn.Module):
@@ -246,61 +214,6 @@ class GAE(nn.Module):
         returns = advantages + value
         return advantages, returns
 
-
-def init_(module):
-    if isinstance(module, nn.Linear):
-        nn.init.orthogonal_(module.weight, 0.01)
-        nn.init.constant_(module.bias, 0.)
-
-
-def compute_policy_loss(
-    tensordict: TensorDictBase,
-    actor: ProbabilisticActor,
-    clip_param: float,
-    entropy_coef: float,
-    discard_init: bool=True,
-):
-    dist = actor.get_dist(tensordict)
-    log_probs = dist.log_prob(tensordict[ACTION_KEY])
-    entropy = dist.entropy()
-
-    adv = tensordict["adv"]
-    ratio = torch.exp(log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
-    surr1 = adv * ratio
-    surr2 = adv * ratio.clamp(1. - clip_param, 1. + clip_param)
-    policy_loss = torch.min(surr1, surr2)
-    if discard_init:
-        policy_loss = policy_loss * (~tensordict["is_init"])
-    policy_loss = - torch.mean(policy_loss) * dist.event_shape[-1]
-    entropy_loss = - entropy_coef * torch.mean(entropy)
-    return policy_loss, entropy_loss, entropy.mean()
-
-
-def compute_value_loss(
-    tensordict: TensorDictBase, 
-    critic: ModBase,
-    clip_param: float,
-    critic_loss_fn: nn.Module,
-    discard_init: bool=True,
-):
-    # b_values = tensordict["state_value"]
-    b_returns = tensordict["ret"]
-    values = critic(tensordict)["state_value"]
-    # values_clipped = b_values + (values - b_values).clamp(-clip_param, clip_param)
-    # value_loss_clipped = critic_loss_fn(b_returns, values_clipped)
-    value_loss_original = critic_loss_fn(b_returns, values)
-    # value_loss = torch.max(value_loss_original, value_loss_clipped).mean()
-
-    # mask out first transitions which are generally invalid
-    # due to the limiatations of Isaac Sim
-    if discard_init:
-        value_loss_original = value_loss_original * (~tensordict["is_init"])
-    value_loss = value_loss_original.mean()
-    explained_var = 1 - value_loss_original.detach() / b_returns.var()
-
-    return value_loss, explained_var
-
-
 def hard_copy_(source_module: nn.Module, target_module: nn.Module):
     for params_source, params_target in zip(source_module.parameters(), target_module.parameters()):
         params_target.data.copy_(params_source.data)
@@ -310,74 +223,33 @@ def soft_copy_(source_module: nn.Module, target_module: nn.Module, tau: float = 
         params_target.data.lerp_(params_source.data, tau)
 
 
-class L2Norm(nn.Module):
-    
-    def forward(self, x):
-        return x / torch.norm(x, dim=-1, keepdim=True).clamp(1e-7)
+@torch.compile
+def adv_normalize(v: torch.Tensor, mask: torch.Tensor):
+    if aa.is_distributed():
+        local_count = mask.sum()
+        local_sum = (v * mask).sum()
+        local_sum_sq = (v * v * mask).sum()
 
-class SimNorm(nn.Module):
-    """
-    Simplicial normalization.
-    Adapted from https://arxiv.org/abs/2204.00616.
-    """
+        stats = torch.stack([local_sum, local_sum_sq, local_count.float()])
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    def __init__(self, dim: int, method="l2"):
-        super().__init__()
-        self.dim = dim
-        if method == "softmax":
-            self.f = F.softmax
-        elif method == "l2":
-            self.f = lambda x: x / x.norm(dim=-1, keepdim=True).clamp(1e-6)
-        else:
-            raise NotImplementedError
+        global_sum, global_sum_sq, global_count = stats
+        global_count.clamp_min_(1)
 
-    def forward(self, x: torch.Tensor):
-        shp = x.shape
-        x = x.view(*shp[:-1], -1, self.dim)
-        x = self.f(x)
-        return x.view(*shp)
+        mean = global_sum / global_count
+        var = (global_sum_sq / global_count) - (mean * mean)
+        std = torch.sqrt(var.clamp(min=0.0)).clamp(min=1e-5)
+    else:
+        count = mask.sum().clamp_min_(1)
+        sum_ = (v * mask).sum()
+        sum_sq = (v * v * mask).sum()
 
+        mean = sum_ / count
+        var = (sum_sq / count) - (mean * mean)
+        std = torch.sqrt(var.clamp(min=0.0)).clamp(min=1e-5)
 
-class ConsistentDropout(nn.Module):
-    def __init__(self, p: float, return_mask: bool=True):
-        super().__init__()
-        self.p = p
-        self.scale_factor = 1 / (1- p)
-        self.return_mask = return_mask
-    
-    def forward(self, input: torch.Tensor, mask=None):
-        if mask is None:
-            mask = input.data.bernoulli(self.p)
-        if self.return_mask:
-            return input * mask * self.scale_factor, mask
-        else:
-            return input * mask * self.scale_factor
-
-
-class MaskWithEmbedding(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.embedding = nn.Parameter(torch.zeros(dim))
-        nn.init.normal_(self.embedding)
-    
-    def forward(self, input, mask):
-        output = torch.where(mask, self.embedding.expand_as(input), input.detach())
-        return output
-
-
-class NormalExtractor(nn.Module):
-    def __init__(self, include_loc: bool=True, num_samples: int = 1):
-        super().__init__()
-        self.include_loc = include_loc
-        self.num_sample = num_samples
-
-    def forward(self, x: torch.Tensor):
-        x_loc, x_scale = x.chunk(2, -1)
-        x_sample = x_loc.unsqueeze(-2).expand(*x_loc.shape[:-1], self.num_sample, -1)
-        x_sample = x_sample + torch.randn_like(x_sample) * x_scale.exp().unsqueeze(-2)
-        if self.include_loc:
-            x_sample = torch.cat([x_sample, x_loc.unsqueeze(-2)], dim=-2)
-        return x_sample.flatten(-2), x_loc, x_scale
+    v[mask] = (v[mask] - mean) / std
+    return v
 
 
 class CatTensors(ModBase):
@@ -397,37 +269,3 @@ class CatTensors(ModBase):
         if self.del_keys:
             tensordict.exclude(*self.in_keys, inplace=True)
         return tensordict
-
-
-def collect_info(infos, prefix=""):
-    return {prefix+k: v.mean().item() for k, v in torch.stack(infos).items()}
-
-
-def normalize(x: torch.Tensor, subtract_mean: bool=False):
-    if subtract_mean:
-        return (x - x.mean()) / x.std().clamp(1e-7)
-    else:
-        return x  / x.std().clamp(1e-7)
-
-
-def parse_keys(spec: Composite, keys: list[str]):
-    """
-    Parse the keys into `mlp_keys`, `cnn_keys`, and `aux_keys`.
-    Keys ending with "_" are considered auxiliary keys.
-
-    """
-    mlp_keys = []
-    cnn_keys = []
-    aux_keys = []
-    
-    for key in keys:
-        if key in spec.keys(True, True):
-            _spec = spec[key]
-        if key.endswith("_"):
-            aux_keys.append(key)
-            continue
-        if _spec.ndim == 2:
-            mlp_keys.append(key)
-        else:
-            cnn_keys.append(key)
-    return mlp_keys, cnn_keys, aux_keys

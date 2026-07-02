@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from active_adaptation.utils.math import normalize, quat_apply, quat_apply_inverse, quat_conjugate, quat_from_angle_axis, quat_mul
 from active_adaptation.utils.motion import MotionData, MotionMinimalData
+
+_AVG5_KERNELS: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
 
 def _basename(name: str) -> str:
@@ -74,6 +79,21 @@ def angvel_from_quat_wxyz_torch(quat_wxyz: torch.Tensor, fps: float, dim: int) -
     return omega.reshape(quat_t.shape[:-1] + (3,)).movedim(0, dim)
 
 
+def smooth_avg5_torch(x: torch.Tensor, dim: int) -> torch.Tensor:
+    x_t = x.movedim(dim, 0)
+    if x_t.shape[0] < 2:
+        return x
+    flat = x_t.reshape(x_t.shape[0], -1).transpose(0, 1).unsqueeze(1)
+    padded = F.pad(flat, (2, 2), mode="replicate")
+    key = (str(x.device), x.dtype)
+    kernel = _AVG5_KERNELS.get(key)
+    if kernel is None:
+        kernel = torch.ones((1, 1, 5), device=x.device, dtype=x.dtype) / 5.0
+        _AVG5_KERNELS[key] = kernel
+    smooth = F.conv1d(padded, kernel).squeeze(1).transpose(0, 1)
+    return smooth.reshape_as(x_t).movedim(0, dim)
+
+
 @dataclass(frozen=True)
 class FKTreeInfo:
     body_names: list[str]
@@ -98,7 +118,6 @@ class MotionFKHelper:
         output_local_idx: torch.Tensor,
         output_body_names: list[str],
         output_body_ids: torch.Tensor,
-        world_output_idx: int,
     ):
         self.device = device
         self.base_body_id = int(base_body_id)
@@ -113,9 +132,67 @@ class MotionFKHelper:
         self.output_local_idx = output_local_idx
         self.output_body_names = output_body_names
         self.output_body_ids = output_body_ids
-        self.world_output_idx = int(world_output_idx)
         self.base_local_idx = int((self.tree_body_ids == self.base_body_id).nonzero(as_tuple=False)[0].item())
-        self._dtype_cache: dict[torch.dtype, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.body_pos0 = self.body_pos0.to(dtype=torch.float32, device=self.device)
+        self.body_quat0 = normalize(self.body_quat0.to(dtype=torch.float32, device=self.device))
+        self.joint_pos_local = self.joint_pos_local.to(dtype=torch.float32, device=self.device)
+        self.joint_axis_local = normalize(self.joint_axis_local.to(dtype=torch.float32, device=self.device))
+        self._tree_size = int(self.tree_body_ids.numel())
+        self._body_count = len(self.output_body_names)
+        self._parent_local_idx_cpu = self.parent_local_idx.detach().cpu().tolist()
+        self._joint_types_cpu = self.joint_types.detach().cpu().tolist()
+        self._valid_output_idx = (self.output_local_idx >= 0).nonzero(as_tuple=False).squeeze(-1)
+        self._valid_output_local_idx = self.output_local_idx[self._valid_output_idx]
+        self._depth_groups = self._build_depth_groups()
+
+    def _make_group(self, local_ids: list[int]):
+        if len(local_ids) == 0:
+            return None
+        local_idx = torch.tensor(local_ids, device=self.device, dtype=torch.long)
+        return {
+            "local_idx": local_idx,
+            "parent_idx": self.parent_local_idx.index_select(0, local_idx),
+            "pos0": self.body_pos0.index_select(0, local_idx),
+            "quat0": self.body_quat0.index_select(0, local_idx),
+            "joint_dataset_idx": self.joint_dataset_idx.index_select(0, local_idx),
+            "joint_pos_local": self.joint_pos_local.index_select(0, local_idx),
+            "joint_axis_local": self.joint_axis_local.index_select(0, local_idx),
+        }
+
+    def _build_depth_groups(self):
+        depths = [0] * self._tree_size
+        max_depth = 0
+        for local_idx in range(self._tree_size):
+            parent_idx = self._parent_local_idx_cpu[local_idx]
+            if parent_idx >= 0:
+                depths[local_idx] = depths[parent_idx] + 1
+                max_depth = max(max_depth, depths[local_idx])
+
+        groups = []
+        for depth in range(1, max_depth + 1):
+            fixed_ids = []
+            slide_ids = []
+            hinge_ids = []
+            for local_idx, node_depth in enumerate(depths):
+                if node_depth != depth:
+                    continue
+                joint_type = self._joint_types_cpu[local_idx]
+                if joint_type < 0:
+                    fixed_ids.append(local_idx)
+                elif joint_type == 2:
+                    slide_ids.append(local_idx)
+                elif joint_type == 3:
+                    hinge_ids.append(local_idx)
+                else:
+                    raise RuntimeError(f"Unsupported joint type {joint_type} in FK depth grouping.")
+            groups.append(
+                {
+                    "fixed": self._make_group(fixed_ids),
+                    "slide": self._make_group(slide_ids),
+                    "hinge": self._make_group(hinge_ids),
+                }
+            )
+        return groups
 
     @property
     def tree_info(self) -> FKTreeInfo:
@@ -136,7 +213,7 @@ class MotionFKHelper:
         device = torch.device(asset.data.device)
         model = asset.data.model
 
-        body_name_to_id = {"world": 0}
+        body_name_to_id = {}
         for i, name in enumerate(asset.body_names):
             gid = int(asset.indexing.body_ids[i].item())
             body_name_to_id[_basename(name)] = gid
@@ -156,6 +233,82 @@ class MotionFKHelper:
             output_body_names=list(output_body_names),
             base_body_name=base_body_name,
             device=device,
+        )
+
+    @classmethod
+    def from_mjcf_path(
+        cls,
+        *,
+        xml_path: str | Path,
+        dataset_joint_names: Sequence[str],
+        output_body_names: Sequence[str] | None = None,
+        base_body_name: str | None = None,
+        device: str | torch.device = "cpu",
+    ) -> "MotionFKHelper":
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        return cls.from_mujoco_model(
+            model=model,
+            dataset_joint_names=dataset_joint_names,
+            output_body_names=output_body_names,
+            base_body_name=base_body_name,
+            device=device,
+        )
+
+    @classmethod
+    def from_mujoco_model(
+        cls,
+        *,
+        model: Any,
+        dataset_joint_names: Sequence[str],
+        output_body_names: Sequence[str] | None = None,
+        base_body_name: str | None = None,
+        device: str | torch.device = "cpu",
+    ) -> "MotionFKHelper":
+        import mujoco
+
+        torch_device = torch.device(device)
+
+        body_name_to_id: dict[str, int] = {}
+        ordered_body_names: list[str] = []
+        for body_id in range(1, int(model.nbody)):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if not name:
+                raise ValueError(f"Unnamed body id={body_id}")
+            short_name = _basename(name)
+            body_name_to_id[short_name] = body_id
+            ordered_body_names.append(short_name)
+
+        joint_id_to_name: dict[int, str] = {}
+        free_base_body_id: int | None = None
+        for joint_id in range(int(model.njnt)):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if name:
+                joint_id_to_name[joint_id] = _basename(name)
+            elif int(model.jnt_type[joint_id]) != int(mujoco.mjtJoint.mjJNT_FREE):
+                raise ValueError(f"Unnamed actuated joint id={joint_id}")
+
+            if int(model.jnt_type[joint_id]) == int(mujoco.mjtJoint.mjJNT_FREE):
+                free_base_body_id = int(model.jnt_bodyid[joint_id])
+
+        if base_body_name is None:
+            if free_base_body_id is not None and free_base_body_id > 0:
+                base_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, free_base_body_id)
+            elif ordered_body_names:
+                base_body_name = ordered_body_names[0]
+        if base_body_name is None:
+            raise ValueError("Could not infer a base body from the MuJoCo model")
+        base_body_name = _basename(base_body_name)
+
+        return cls._build(
+            model=model,
+            body_name_to_id=body_name_to_id,
+            joint_id_to_name=joint_id_to_name,
+            dataset_joint_names=dataset_joint_names,
+            output_body_names=list(output_body_names or ordered_body_names),
+            base_body_name=base_body_name,
+            device=torch_device,
         )
 
     @classmethod
@@ -184,11 +337,7 @@ class MotionFKHelper:
         base_body_id = int(body_name_to_id[base_body_name])
 
         requested_ids: list[int] = []
-        world_output_idx = -1
-        for out_idx, body_name in enumerate(output_body_names):
-            if body_name == "world":
-                world_output_idx = out_idx
-                continue
+        for body_name in output_body_names:
             if body_name not in body_name_to_id:
                 raise ValueError(f"Output body '{body_name}' not found in model")
             requested_ids.append(int(body_name_to_id[body_name]))
@@ -271,11 +420,8 @@ class MotionFKHelper:
             joint_axis_local[local_idx] = jnt_axis[joint_id]
             joint_dataset_idx[local_idx] = joint_name_to_dataset_idx[joint_name]
 
-        missing_mask = output_local_idx < 0
-        if world_output_idx >= 0:
-            missing_mask[world_output_idx] = False
-        if missing_mask.any():
-            missing = [output_body_names[i] for i in missing_mask.nonzero(as_tuple=False).squeeze(-1).tolist()]
+        if (output_local_idx < 0).any():
+            missing = [output_body_names[i] for i in (output_local_idx < 0).nonzero(as_tuple=False).squeeze(-1).tolist()]
             raise ValueError(f"Failed to resolve requested output bodies: {missing}")
 
         return cls(
@@ -292,116 +438,119 @@ class MotionFKHelper:
             output_local_idx=output_local_idx,
             output_body_names=output_body_names,
             output_body_ids=output_body_ids,
-            world_output_idx=world_output_idx,
         )
-
-    def _typed_constants(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        cached = self._dtype_cache.get(dtype)
-        if cached is None:
-            cached = (
-                self.body_pos0.to(dtype=dtype),
-                normalize(self.body_quat0.to(dtype=dtype)),
-                self.joint_pos_local.to(dtype=dtype),
-                normalize(self.joint_axis_local.to(dtype=dtype)),
-            )
-            self._dtype_cache[dtype] = cached
-        return cached
 
     def body_pose(
         self,
-        root_pos_w: torch.Tensor,
-        root_quat_w: torch.Tensor,
         joint_pos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        dtype = root_pos_w.dtype
-        if root_pos_w.device != self.device:
-            raise RuntimeError(f"FK helper device mismatch: helper={self.device}, root={root_pos_w.device}")
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if joint_pos.dtype != torch.float32:
+            raise RuntimeError("FK helper expects float32 joint_pos input")
 
-        prefix = root_pos_w.shape[:-1]
-        flat_count = int(torch.tensor(prefix).prod().item()) if len(prefix) > 0 else 1
+        prefix = joint_pos.shape[:-1]
+        flat_count = math.prod(prefix) if len(prefix) > 0 else 1
         joint_pos_f = joint_pos.reshape(flat_count, joint_pos.shape[-1])
-        root_pos_f = root_pos_w.reshape(flat_count, 3)
-        root_quat_f = normalize(root_quat_w.reshape(flat_count, 4))
 
-        body_pos0, body_quat0, joint_pos_local, joint_axis_local = self._typed_constants(dtype)
-        tree_pos_b = torch.zeros((flat_count, len(self.tree_body_ids), 3), device=self.device, dtype=dtype)
-        tree_quat_b = torch.zeros((flat_count, len(self.tree_body_ids), 4), device=self.device, dtype=dtype)
+        tree_pos_b = torch.zeros((flat_count, self._tree_size, 3), device=self.device, dtype=torch.float32)
+        tree_quat_b = torch.zeros((flat_count, self._tree_size, 4), device=self.device, dtype=torch.float32)
         tree_quat_b[:, self.base_local_idx, 0] = 1.0
 
-        for local_idx in range(len(self.tree_body_ids)):
-            if local_idx == self.base_local_idx:
-                continue
-            parent_idx = int(self.parent_local_idx[local_idx].item())
-            if parent_idx < 0:
-                continue
+        for depth_group in self._depth_groups:
+            fixed_group = depth_group["fixed"]
+            if fixed_group is not None:
+                parent_pos_b = tree_pos_b.index_select(1, fixed_group["parent_idx"])
+                parent_quat_b = tree_quat_b.index_select(1, fixed_group["parent_idx"])
+                rel_quat = fixed_group["quat0"].unsqueeze(0)
+                rel_pos = fixed_group["pos0"].unsqueeze(0)
+                tree_quat_b.index_copy_(
+                    1,
+                    fixed_group["local_idx"],
+                    normalize(quat_mul(parent_quat_b, rel_quat)),
+                )
+                tree_pos_b.index_copy_(
+                    1,
+                    fixed_group["local_idx"],
+                    parent_pos_b + quat_apply(parent_quat_b, rel_pos),
+                )
 
-            parent_pos_b = tree_pos_b[:, parent_idx]
-            parent_quat_b = tree_quat_b[:, parent_idx]
-            pos0 = body_pos0[local_idx].unsqueeze(0)
-            quat0 = body_quat0[local_idx].unsqueeze(0)
-            joint_type = int(self.joint_types[local_idx].item())
-
-            if joint_type < 0:
+            slide_group = depth_group["slide"]
+            if slide_group is not None:
+                parent_pos_b = tree_pos_b.index_select(1, slide_group["parent_idx"])
+                parent_quat_b = tree_quat_b.index_select(1, slide_group["parent_idx"])
+                quat0 = slide_group["quat0"].unsqueeze(0)
+                pos0 = slide_group["pos0"].unsqueeze(0)
+                axis_local = slide_group["joint_axis_local"].unsqueeze(0)
+                joint_value = joint_pos_f.index_select(1, slide_group["joint_dataset_idx"])
+                axis_parent = quat_apply(quat0, axis_local)
                 rel_quat = quat0
-                rel_pos = pos0
-            else:
-                joint_idx = int(self.joint_dataset_idx[local_idx].item())
-                joint_value = joint_pos_f[:, joint_idx]
-                axis_local = joint_axis_local[local_idx].unsqueeze(0)
-                anchor_local = joint_pos_local[local_idx].unsqueeze(0)
+                rel_pos = pos0 + axis_parent * joint_value.unsqueeze(-1)
+                tree_quat_b.index_copy_(
+                    1,
+                    slide_group["local_idx"],
+                    normalize(quat_mul(parent_quat_b, rel_quat)),
+                )
+                tree_pos_b.index_copy_(
+                    1,
+                    slide_group["local_idx"],
+                    parent_pos_b + quat_apply(parent_quat_b, rel_pos),
+                )
 
-                if joint_type == 3:
-                    joint_quat = quat_from_angle_axis(joint_value, axis_local)
-                    rel_quat = quat_mul(quat0, joint_quat)
-                    rel_pos = pos0 + quat_apply(quat0, anchor_local - quat_apply(joint_quat, anchor_local))
-                else:
-                    axis_parent = quat_apply(quat0, axis_local)
-                    rel_quat = quat0
-                    rel_pos = pos0 + axis_parent * joint_value.unsqueeze(-1)
+            hinge_group = depth_group["hinge"]
+            if hinge_group is not None:
+                parent_pos_b = tree_pos_b.index_select(1, hinge_group["parent_idx"])
+                parent_quat_b = tree_quat_b.index_select(1, hinge_group["parent_idx"])
+                quat0 = hinge_group["quat0"].unsqueeze(0)
+                pos0 = hinge_group["pos0"].unsqueeze(0)
+                axis_local = hinge_group["joint_axis_local"].unsqueeze(0)
+                anchor_local = hinge_group["joint_pos_local"].unsqueeze(0)
+                joint_value = joint_pos_f.index_select(1, hinge_group["joint_dataset_idx"])
+                joint_quat = quat_from_angle_axis(joint_value, axis_local)
+                rel_quat = quat_mul(quat0, joint_quat)
+                rel_pos = pos0 + quat_apply(quat0, anchor_local - quat_apply(joint_quat, anchor_local))
+                tree_quat_b.index_copy_(
+                    1,
+                    hinge_group["local_idx"],
+                    normalize(quat_mul(parent_quat_b, rel_quat)),
+                )
+                tree_pos_b.index_copy_(
+                    1,
+                    hinge_group["local_idx"],
+                    parent_pos_b + quat_apply(parent_quat_b, rel_pos),
+                )
 
-            tree_quat_b[:, local_idx] = normalize(quat_mul(parent_quat_b, rel_quat))
-            tree_pos_b[:, local_idx] = parent_pos_b + quat_apply(parent_quat_b, rel_pos)
-
-        body_count = len(self.output_body_names)
-        body_pos_b = torch.zeros((flat_count, body_count, 3), device=self.device, dtype=dtype)
-        body_quat_b = torch.zeros((flat_count, body_count, 4), device=self.device, dtype=dtype)
+        body_pos_b = torch.zeros((flat_count, self._body_count, 3), device=self.device, dtype=torch.float32)
+        body_quat_b = torch.zeros((flat_count, self._body_count, 4), device=self.device, dtype=torch.float32)
         body_quat_b[..., 0] = 1.0
 
-        valid_output = (self.output_local_idx >= 0).nonzero(as_tuple=False).squeeze(-1)
-        if valid_output.numel() > 0:
-            local_ids = self.output_local_idx[valid_output]
-            body_pos_b[:, valid_output] = tree_pos_b[:, local_ids]
-            body_quat_b[:, valid_output] = tree_quat_b[:, local_ids]
+        if self._valid_output_idx.numel() > 0:
+            body_pos_b.index_copy_(1, self._valid_output_idx, tree_pos_b.index_select(1, self._valid_output_local_idx))
+            body_quat_b.index_copy_(1, self._valid_output_idx, tree_quat_b.index_select(1, self._valid_output_local_idx))
 
-        body_pos_w = quat_apply(root_quat_f.unsqueeze(1), body_pos_b) + root_pos_f.unsqueeze(1)
-        body_quat_w = normalize(quat_mul(root_quat_f.unsqueeze(1), body_quat_b))
-
-        if self.world_output_idx >= 0:
-            world_idx = self.world_output_idx
-            body_pos_w[:, world_idx] = 0.0
-            body_quat_w[:, world_idx] = 0.0
-            body_quat_w[:, world_idx, 0] = 1.0
-            body_pos_b[:, world_idx] = quat_apply_inverse(root_quat_f, -root_pos_f)
-            body_quat_b[:, world_idx] = quat_conjugate(root_quat_f)
-
-        body_pos_b = body_pos_b.reshape(prefix + (body_count, 3))
-        body_quat_b = body_quat_b.reshape(prefix + (body_count, 4))
-        body_pos_w = body_pos_w.reshape(prefix + (body_count, 3))
-        body_quat_w = body_quat_w.reshape(prefix + (body_count, 4))
-        return body_pos_b, body_quat_b, body_pos_w, body_quat_w
+        body_pos_b = body_pos_b.reshape(prefix + (self._body_count, 3))
+        body_quat_b = body_quat_b.reshape(prefix + (self._body_count, 4))
+        return body_pos_b, body_quat_b
 
     def expand_minimal_motion(self, motion: MotionMinimalData, fps: float) -> MotionData:
-        root_pos_w = motion.root_pos_w.to(dtype=torch.float32, device=self.device)
-        root_quat_w = normalize(motion.root_quat_w.to(dtype=torch.float32, device=self.device))
-        joint_pos = motion.joint_pos.to(dtype=torch.float32, device=self.device)
+        if motion.root_pos_w.dtype != torch.float32 or motion.root_quat_w.dtype != torch.float32 or motion.joint_pos.dtype != torch.float32:
+            raise RuntimeError("FK helper expects MotionMinimalData float32 tensors")
+        root_pos_w = motion.root_pos_w
+        root_quat_w = normalize(motion.root_quat_w)
+        joint_pos = motion.joint_pos
 
-        root_lin_vel_w = finite_diff_torch(root_pos_w, fps, dim=1)
-        root_ang_vel_w = angvel_from_quat_wxyz_torch(root_quat_w, fps, dim=1)
-        joint_vel = finite_diff_torch(joint_pos, fps, dim=1)
-        body_pos_b, body_quat_b, body_pos_w, body_quat_w = self.body_pose(root_pos_w, root_quat_w, joint_pos)
-        body_vel_w = finite_diff_torch(body_pos_w, fps, dim=1)
-        body_vel_b = quat_apply_inverse(root_quat_w.unsqueeze(2), body_vel_w - root_lin_vel_w.unsqueeze(2))
-        body_angvel_b = angvel_from_quat_wxyz_torch(body_quat_b, fps, dim=1)
+        root_lin_vel_w = smooth_avg5_torch(finite_diff_torch(root_pos_w, fps, dim=1), dim=1)
+        root_ang_vel_w = smooth_avg5_torch(angvel_from_quat_wxyz_torch(root_quat_w, fps, dim=1), dim=1)
+        joint_vel = smooth_avg5_torch(finite_diff_torch(joint_pos, fps, dim=1), dim=1)
+        body_pos_b, body_quat_b = self.body_pose(joint_pos)
+        body_pos_w = quat_apply(root_quat_w.unsqueeze(2), body_pos_b) + root_pos_w.unsqueeze(2)
+        body_quat_w = normalize(quat_mul(root_quat_w.unsqueeze(2), body_quat_b))
+
+        root_ang_vel_b = quat_apply_inverse(root_quat_w, root_ang_vel_w)
+        body_vel_b = smooth_avg5_torch(
+            finite_diff_torch(body_pos_b, fps, dim=1) + torch.cross(root_ang_vel_b.unsqueeze(2), body_pos_b, dim=-1),
+            dim=1,
+        )
+        body_angvel_b = smooth_avg5_torch(angvel_from_quat_wxyz_torch(body_quat_b, fps, dim=1), dim=1)
+        body_vel_w = quat_apply(root_quat_w.unsqueeze(2), body_vel_b) + root_lin_vel_w.unsqueeze(2)
         body_angvel_w = quat_apply(root_quat_w.unsqueeze(2), body_angvel_b) + root_ang_vel_w.unsqueeze(2)
 
         return MotionData(
@@ -422,24 +571,3 @@ class MotionFKHelper:
             batch_size=list(motion.batch_size),
             device=self.device,
         )
-
-    def rewrite_motion_data_(self, motion: MotionData, fps: float) -> MotionData:
-        root_pos_w = motion.root_pos_w.to(dtype=torch.float32, device=self.device)
-        root_quat_w = normalize(motion.root_quat_w.to(dtype=torch.float32, device=self.device))
-        body_pos_b, body_quat_b, body_pos_w, body_quat_w = self.body_pose(root_pos_w, root_quat_w, motion.joint_pos.to(dtype=torch.float32, device=self.device))
-        body_vel_w = finite_diff_torch(body_pos_w, fps, dim=1)
-        root_lin_vel_w = motion.root_lin_vel_w.to(dtype=torch.float32, device=self.device)
-        root_ang_vel_w = motion.root_ang_vel_w.to(dtype=torch.float32, device=self.device)
-        body_vel_b = quat_apply_inverse(root_quat_w.unsqueeze(2), body_vel_w - root_lin_vel_w.unsqueeze(2))
-        body_angvel_b = angvel_from_quat_wxyz_torch(body_quat_b, fps, dim=1)
-        body_angvel_w = quat_apply(root_quat_w.unsqueeze(2), body_angvel_b) + root_ang_vel_w.unsqueeze(2)
-
-        motion.body_pos_b = body_pos_b.to(dtype=motion.body_pos_b.dtype)
-        motion.body_quat_b = body_quat_b.to(dtype=motion.body_quat_b.dtype)
-        motion.body_pos_w = body_pos_w.to(dtype=motion.body_pos_w.dtype)
-        motion.body_quat_w = body_quat_w.to(dtype=motion.body_quat_w.dtype)
-        motion.body_vel_w = body_vel_w.to(dtype=motion.body_vel_w.dtype)
-        motion.body_vel_b = body_vel_b.to(dtype=motion.body_vel_b.dtype)
-        motion.body_angvel_b = body_angvel_b.to(dtype=motion.body_angvel_b.dtype)
-        motion.body_angvel_w = body_angvel_w.to(dtype=motion.body_angvel_w.dtype)
-        return motion

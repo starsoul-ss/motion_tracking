@@ -6,4 +6,4 @@ defaults:
 task:
   student_train: true
 
-total_frames: 1000_000_000
+total_frames: 500_000_000

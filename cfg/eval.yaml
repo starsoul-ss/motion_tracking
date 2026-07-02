@@ -35,7 +35,7 @@ wandb:
 
 
 defaults:
-  - task: G1/G1
+  - task: tracking
   - _self_
 
 task:

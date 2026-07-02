@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Tuple
 
 
-def resolve_contact_indices(contact_sensor, asset, name_keys) -> Tuple[list[int], list[str]]:
-    """Resolve contact sensor indices for given body name patterns.
+def resolve_contact_indices(contact_sensor, asset, name_keys) -> Tuple[list[int], list[int], list[str]]:
+    """Resolve both contact-sensor indices and asset body indices for body patterns.
 
-    MJLab ContactSensor does not expose find_bodies; we mirror its primary
-    matching order using the entity's body list.
+    MJLab ContactSensor does not expose ``find_bodies``. Its output is indexed by
+    the sensor primary list built from ``cfg.primary``, so we reconstruct that
+    primary ordering here and map requested asset bodies onto it.
     """
-    if hasattr(contact_sensor, "find_bodies"):
-        return contact_sensor.find_bodies(name_keys)
 
     primary_names = None
     try:
@@ -27,9 +26,12 @@ def resolve_contact_indices(contact_sensor, asset, name_keys) -> Tuple[list[int]
         primary_names = None
 
     if primary_names is None:
-        primary_names = list(asset.body_names)
+        raise RuntimeError(
+            "Failed to resolve contact sensor primary names from contact_sensor.cfg.primary. "
+            "Contact indices must be mapped against the sensor primary ordering explicitly."
+        )
 
-    _, target_names = asset.find_bodies(name_keys)
+    target_ids, target_names = asset.find_bodies(name_keys)
     name_to_index = {n: i for i, n in enumerate(primary_names)}
     indices: list[int] = []
     missing = []
@@ -45,4 +47,4 @@ def resolve_contact_indices(contact_sensor, asset, name_keys) -> Tuple[list[int]
             f"Primary set size={len(primary_names)}."
         )
 
-    return indices, target_names
+    return indices, target_ids, target_names

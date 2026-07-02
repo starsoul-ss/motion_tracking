@@ -22,6 +22,7 @@ vecnorm: ${oc.select:algo.vecnorm,train}
 camera_follow: false
 
 train_record:
+  enabled: false
   interval: 50
   envs: 16
   steps: 500
@@ -30,7 +31,7 @@ train_record:
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: gentle_humanoid
+  project: heft # change this to your own project if you want to log to wandb
   mode: online # set to 'disabled' when debugging locally
   tags: []
   id: null
@@ -40,6 +41,6 @@ wandb:
     https_proxy: null
 
 defaults:
-  - task: G1/G1_gentle
+  - task: tracking
   - algo: ppo_train
   - _self_

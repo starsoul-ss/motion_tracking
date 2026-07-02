@@ -1,104 +1,16 @@
 from math import inf
-import inspect
 import torch
-import abc
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import mjlab.utils.lab_api.string as string_utils
 from mjlab.utils.lab_api.string import resolve_matching_names
 from active_adaptation.utils.math import quat_apply, quat_apply_inverse, yaw_quat, normalize
-from ..commands import *
 from active_adaptation.envs.mdp.contact_utils import resolve_contact_indices
+from .base import Reward
 
 if TYPE_CHECKING:
     from mjlab.sensor import ContactSensor
     from mjlab.entity import Entity as Articulation
-    from active_adaptation.envs.base import _Env
-
-
-class Reward:
-    def __init__(
-        self,
-        env,
-        weight: float,
-        enabled: bool = True,
-    ):
-        self.env: _Env = env
-        self.weight = weight
-        self.enabled = enabled
-
-    @property
-    def num_envs(self):
-        return self.env.num_envs
-
-    @property
-    def device(self):
-        return self.env.device
-
-    def step(self, substep: int):
-        pass
-
-    def post_step(self, substep: int):
-        pass
-
-    def update(self):
-        pass
-
-    def reset(self, env_ids: torch.Tensor):
-        pass
-
-    def __call__(self) -> torch.Tensor:
-        result = self.compute()
-        if isinstance(result, torch.Tensor):
-            rew, count = result, result.numel()
-        elif isinstance(result, tuple):
-            rew, is_active = result
-            rew = rew * is_active.float()
-            count = is_active.sum().item()
-        return self.weight * rew, count 
-
-    @abc.abstractmethod
-    def compute(self) -> torch.Tensor:
-        raise NotImplementedError
-
-    def debug_draw(self):
-        pass
-
-
-def reward_func(func):
-    class RewFunc(Reward):
-        def compute(self):
-            return func(self.env)
-
-    return RewFunc
-
-
-def reward_wrapper(func: Callable[[], torch.Tensor]):
-    def _select_kwargs(fn: Callable, params: dict):
-        sig = inspect.signature(fn)
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-            return dict(params), True
-        valid_keys = {
-            name for name, p in sig.parameters.items()
-            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        }
-        return {k: v for k, v in params.items() if k in valid_keys}, False
-
-    class RewardWrapper(Reward):
-        def __init__(self, env, weight: float, enabled: bool = True, **params):
-            super().__init__(env, weight=weight, enabled=enabled)
-            self.params = params
-            self._func_kwargs, func_accepts_all = _select_kwargs(func, params)
-            if not func_accepts_all:
-                unknown = set(params.keys()) - set(self._func_kwargs.keys())
-                if len(unknown) > 0:
-                    raise ValueError(
-                        f"Unknown YAML params for wrapped reward '{func.__name__}': {sorted(unknown)}"
-                    )
-
-        def compute(self):
-            return func(**self._func_kwargs)
-    return RewardWrapper
 
 
 class _ContactMajorityCache:
@@ -178,9 +90,24 @@ def _get_contact_majority_cache(env, contact_sensor):
     return cache
 
 
-@reward_func
-def survival(self):
-    return torch.ones(self.num_envs, 1, device=self.device)
+def _feet_sides(names: list[str], *, context: str) -> list[str]:
+    sides = ["left" if "left" in name.lower() else "right" if "right" in name.lower() else None for name in names]
+    if len(names) != 2 or sorted(sides) != ["left", "right"]:
+        raise ValueError(f"{context} expects exactly one left foot and one right foot, got {names}")
+    return sides
+
+def _validate_feet_order(env, resolved_names: list[str], *, context: str):
+    command_manager = getattr(env, "command_manager", None)
+    cmd_feet_names = list(getattr(command_manager, "feet_names_asset", ()))
+    if not cmd_feet_names:
+        raise RuntimeError("feet reward requires command_manager.feet_names_asset for order validation.")
+    if _feet_sides(resolved_names, context=context) != _feet_sides(cmd_feet_names, context="command feet"):
+        raise ValueError(f"{context} resolved feet order {resolved_names} does not match command feet order {cmd_feet_names}")
+
+
+class survival(Reward):
+    def compute(self) -> torch.Tensor:
+        return torch.ones(self.num_envs, 1, device=self.device)
 
 
 class joint_torques_l2(Reward):
@@ -213,25 +140,16 @@ class impact_force_l2(Reward):
         self,
         env,
         body_names,
-        body2_names=None,
         weight: float = 1.0,
         enabled: bool = True,
     ):
         super().__init__(env, weight, enabled)
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
-        self.body_ids, self.body_names = resolve_contact_indices(
+        self.body_ids, self.articulation_body_ids, self.body_names = resolve_contact_indices(
             self.contact_sensor, self.asset, body_names
         )
-        self.articulation_body_ids = self.asset.find_bodies(self.body_names)[0]
-        if body2_names is None:
-            self.articulation_body2_ids = self.articulation_body_ids
-        else:
-            self.articulation_body2_ids = self.asset.find_bodies(body2_names)[0]
-            if len(self.articulation_body2_ids) != len(self.articulation_body_ids):
-                raise ValueError(
-                    "body2_names must match body_names length for impact_force_l2."
-                )
+        self.articulation_body_ids = torch.tensor(self.articulation_body_ids, device=self.device, dtype=torch.long)
         self.last_contact = torch.zeros(
             self.num_envs, len(self.body_ids), device=self.device, dtype=bool
         )
@@ -251,8 +169,7 @@ class impact_force_l2(Reward):
 
     def update(self):
         vel_z = self.asset.data.body_com_lin_vel_w[:, self.articulation_body_ids, 2]
-        vel_z2 = self.asset.data.body_com_lin_vel_w[:, self.articulation_body2_ids, 2]
-        down_vel = torch.maximum((-vel_z).clamp_min(0.0), (-vel_z2).clamp_min(0.0))
+        down_vel = (-vel_z).clamp_min(0.0)
         self.prev_down_vel.copy_(self.down_vel)
         self.down_vel[:] = torch.where(
             self.contact_sensor.data.current_contact_time[:, self.body_ids] > 0.0,
@@ -275,11 +192,11 @@ class feet_slip(Reward):
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
 
-        self.articulation_body_ids = self.asset.find_bodies(body_names)[0]
-        self.body_ids, self.body_names = resolve_contact_indices(
+        self.body_ids, self.articulation_body_ids, self.body_names = resolve_contact_indices(
             self.contact_sensor, self.asset, body_names
         )
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
+        self.articulation_body_ids = torch.tensor(self.articulation_body_ids, device=self.env.device)
 
     def compute(self) -> torch.Tensor:
         in_contact = self.contact_sensor.data.current_contact_time[:, self.body_ids] > self.env.physics_dt
@@ -321,9 +238,10 @@ class feet_air_time_ref(Reward):
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
 
-        self.body_ids, self.body_names = resolve_contact_indices(
+        self.body_ids, _, self.body_names = resolve_contact_indices(
             self.contact_sensor, self.asset, body_names
         )
+        _validate_feet_order(self.env, self.body_names, context="feet_air_time_ref")
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
         self.contact_cache = _get_contact_majority_cache(self.env, self.contact_sensor)
 
@@ -343,13 +261,10 @@ class feet_air_time_ref(Reward):
         current_contact = self.contact_cache.current_for(self.body_ids)
         first_contact = self.contact_cache.first_contact_for(self.body_ids)
 
-        if hasattr(self.env.command_manager, "skip_ref") and self.env.command_manager.skip_ref:
-            self.reward_time = self.reward_time + self.env.step_dt
-        else:
-            contact_diff = self.env.command_manager.feet_standing ^ current_contact
-            self.reward_time = self.reward_time + torch.where(
-                contact_diff, -self.env.step_dt, self.env.step_dt
-            )
+        contact_diff = self.env.command_manager.feet_standing ^ current_contact
+        self.reward_time = self.reward_time + torch.where(
+            contact_diff, -self.env.step_dt, self.env.step_dt
+        )
         
         self.reward = torch.sum(
             (self.reward_time - self.thres).clamp_max(0.0) * first_contact, dim=1, keepdim=True
@@ -375,19 +290,26 @@ class feet_air_time_ref_dense(Reward):
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
 
-        self.articulation_body_ids = self.asset.find_bodies(body_names)[0]
+        articulation_body_ids, articulation_body_names = self.asset.find_bodies(body_names)
+        _validate_feet_order(self.env, articulation_body_names, context="feet_air_time_ref_dense body_names")
         if body2_names is None:
-            self.articulation_body2_ids = self.articulation_body_ids
+            articulation_body2_ids = articulation_body_ids
         else:
-            self.articulation_body2_ids = self.asset.find_bodies(body2_names)[0]
-            if len(self.articulation_body2_ids) != len(self.articulation_body_ids):
-                raise ValueError(
-                    "body2_names must match body_names length for feet_air_time_ref_dense."
-                )
+            articulation_body2_ids, articulation_body2_names = self.asset.find_bodies(body2_names)
+            _validate_feet_order(self.env, articulation_body2_names, context="feet_air_time_ref_dense body2_names")
+        self.articulation_body_ids = articulation_body_ids
+        self.articulation_body2_ids = articulation_body2_ids
+        self.articulation_body_ids = torch.tensor(
+            self.articulation_body_ids, device=self.env.device, dtype=torch.long
+        )
+        self.articulation_body2_ids = torch.tensor(
+            self.articulation_body2_ids, device=self.env.device, dtype=torch.long
+        )
 
-        self.body_ids, self.body_names = resolve_contact_indices(
+        self.body_ids, _, self.body_names = resolve_contact_indices(
             self.contact_sensor, self.asset, body_names
         )
+        _validate_feet_order(self.env, self.body_names, context="feet_air_time_ref_dense contact bodies")
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
         self.contact_cache = _get_contact_majority_cache(self.env, self.contact_sensor)
 
@@ -440,6 +362,30 @@ class feet_air_time_ref_dense(Reward):
 
         return penalty.mean(dim=1, keepdim=True)
 
+    def debug_draw(self):
+        current_contact = self.contact_cache.current_for(self.body_ids)
+        target_contact = self.env.command_manager.feet_standing
+
+        feet_pos = 0.5 * (
+            self.asset.data.body_link_pos_w[:, self.articulation_body_ids]
+            + self.asset.data.body_link_pos_w[:, self.articulation_body2_ids]
+        )
+
+        both_match = ~(current_contact ^ target_contact)
+        ref_contact_actual_air = target_contact & (~current_contact)
+        ref_air_actual_contact = (~target_contact) & current_contact
+
+        green_points = feet_pos[both_match]
+        red_points = feet_pos[ref_contact_actual_air]
+        blue_points = feet_pos[ref_air_actual_contact]
+
+        if green_points.numel() > 0:
+            self.env.debug_draw.point(green_points, color=(0.0, 1.0, 0.0, 1.0), size=40.0)
+        if red_points.numel() > 0:
+            self.env.debug_draw.point(red_points, color=(1.0, 0.0, 0.0, 1.0), size=40.0)
+        if blue_points.numel() > 0:
+            self.env.debug_draw.point(blue_points, color=(0.0, 0.3, 1.0, 1.0), size=40.0)
+
 class feet_contact_count(Reward):
     def __init__(
         self, env: "LocomotionEnv", body_names: str, weight: float, enabled: bool = True
@@ -448,11 +394,11 @@ class feet_contact_count(Reward):
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
 
-        self.articulation_body_ids = self.asset.find_bodies(body_names)[0]
-        self.body_ids, self.body_names = resolve_contact_indices(
+        self.body_ids, self.articulation_body_ids, self.body_names = resolve_contact_indices(
             self.contact_sensor, self.asset, body_names
         )
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
+        self.articulation_body_ids = torch.tensor(self.articulation_body_ids, device=self.env.device)
         self.contact_cache = _get_contact_majority_cache(self.env, self.contact_sensor)
 
     def reset(self, env_ids: torch.Tensor):
@@ -500,11 +446,17 @@ class joint_acc_l2(Reward):
         super().__init__(env, weight, enabled)
         self.asset: Articulation = self.env.scene["robot"]
         self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
+        self.joint_acc = torch.zeros(
+            self.num_envs, self.env.decimation, len(self.joint_ids), device=self.device
+        )
+
+    def post_step(self, substep):
+        self.joint_acc[:, substep] = self.asset.data.joint_acc[:, self.joint_ids]
     
     def compute(self) -> torch.Tensor:
-        # print(self.asset.data.joint_acc[:, self.joint_ids].max())
-        r = - self.asset.data.joint_acc[:, self.joint_ids].clamp_max(100.0).square().sum(1, True)
-        return r
+        joint_acc = self.joint_acc.mean(1)
+        joint_acc = joint_acc.clamp(-5000.0, 5000.0)
+        return -joint_acc.square().sum(1, True)
 
 class joint_pos_limits(Reward):
     def __init__(self, env, weight: float, joint_names: str | List[str] =".*", soft_factor: float=0.9, enabled: bool = True):
@@ -530,14 +482,13 @@ class joint_torque_limits(Reward):
         super().__init__(env, weight, enabled)
         self.asset: Articulation = self.env.scene["robot"]
         self.joint_ids, self.joint_names = resolve_matching_names(joint_names, self.asset.joint_names)
+        self.soft_factor = float(soft_factor)
 
         # MJLab: derive limits from actuator forcerange (if available)
         model = self.env.sim.model
         if not hasattr(model, "actuator_forcerange"):
             raise RuntimeError("Actuator force limits are not available in MJLab model.")
-        ctrl_ids = self.asset.indexing.ctrl_ids
-        force_range = model.actuator_forcerange[:, ctrl_ids]
-        limits = torch.maximum(force_range[..., 0].abs(), force_range[..., 1].abs())
+        self.ctrl_ids = self.asset.indexing.ctrl_ids
 
         actuator_names = list(self.asset.actuator_names)
         name_to_act = {n: i for i, n in enumerate(actuator_names)}
@@ -548,25 +499,30 @@ class joint_torque_limits(Reward):
             else:
                 act_idx.append(name_to_act[name])
         self.act_idx = torch.tensor(act_idx, device=self.device, dtype=torch.long)
-        self.soft_limits = limits[:, self.act_idx] * soft_factor
+
+    def _get_soft_limits(self) -> torch.Tensor:
+        force_range = self.env.sim.model.actuator_forcerange[:, self.ctrl_ids]
+        limits = torch.maximum(force_range[..., 0].abs(), force_range[..., 1].abs())
+        return limits[:, self.act_idx] * self.soft_factor
     
     def compute(self) -> torch.Tensor:
+        soft_limits = self._get_soft_limits().clamp_min(1e-6)
         applied_torque = self.asset.data.actuator_force[:, self.act_idx]
-        violation_high = (applied_torque / self.soft_limits - 1.0).clamp_min(0.0)
-        violation_low = (-applied_torque / self.soft_limits - 1.0).clamp_min(0.0)
+        violation_high = (applied_torque / soft_limits - 1.0).clamp_min(0.0)
+        violation_low = (-applied_torque / soft_limits - 1.0).clamp_min(0.0)
         return - (violation_high + violation_low).sum(dim=1, keepdim=True)
 
-@reward_func
-def action_rate_l2(self):
-    action_buf = self.action_manager.action_buf
-    action_diff = action_buf[:, 0, :] - action_buf[:, 1, :]
-    return - action_diff.square().sum(dim=-1, keepdim=True)
+class action_rate_l2(Reward):
+    def compute(self) -> torch.Tensor:
+        action_buf = self.action_manager.get_recent_action_rate_actions(2)
+        action_diff = action_buf[:, 0, :] - action_buf[:, 1, :]
+        return - action_diff.square().sum(dim=-1, keepdim=True)
 
 
-@reward_func
-def action_rate2_l2(self):
-    action_buf = self.action_manager.action_buf
-    action_diff = (
-        action_buf[:, 0, :] - 2 * action_buf[:, 1, :] + action_buf[:, 2, :]
-    )
-    return - action_diff.square().sum(dim=-1, keepdim=True)
+class action_rate2_l2(Reward):
+    def compute(self) -> torch.Tensor:
+        action_buf = self.action_manager.get_recent_action_rate_actions(3)
+        action_diff = (
+            action_buf[:, 0, :] - 2 * action_buf[:, 1, :] + action_buf[:, 2, :]
+        )
+        return - action_diff.square().sum(dim=-1, keepdim=True)

@@ -203,3 +203,7 @@ sim2sim/real_g1/plot
 sim2sim/real_g1/*.npy
 motion.npy
 dataset
+
+l7_sim2real/build/
+l7_sim2real/install/
+l7_sim2real/log/

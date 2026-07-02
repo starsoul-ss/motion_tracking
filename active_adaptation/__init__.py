@@ -1,5 +1,4 @@
 import os
-from active_adaptation.learning import ALGOS
 
 _BACKEND = "mjlab"
 

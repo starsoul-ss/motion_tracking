@@ -1,5 +1,5 @@
+import copy
 import torch
-import numpy as np
 import hydra
 import inspect
 import time
@@ -17,8 +17,21 @@ from collections import OrderedDict
 from abc import abstractmethod
 
 import active_adaptation
-import active_adaptation.envs.mdp as mdp
 import active_adaptation.utils.symmetry as symmetry_utils
+from active_adaptation.envs.mdp.action import ActionManager
+from active_adaptation.envs.mdp.commands import Command
+from active_adaptation.envs.mdp.observations import (
+    OBS_REGISTRY,
+    Observation,
+    observation_wrapper,
+)
+from active_adaptation.envs.mdp.randomizations import (
+    RAND_REGISTRY,
+    Randomization,
+    randomization_wrapper,
+)
+from active_adaptation.envs.mdp.rewards import REW_REGISTRY, Reward, reward_wrapper
+from active_adaptation.envs.mdp.terminations import TERM_REGISTRY, Termination, termination_wrapper
 
 class _NullDebugDraw:
     def clear(self):
@@ -30,52 +43,106 @@ class _NullDebugDraw:
     def vector(self, *args, **kwargs):
         pass
 
+    def ghost(self, *args, **kwargs):
+        pass
+
+    def env_indices(self, num_envs: int):
+        del num_envs
+        return []
+
 
 class _ViserDebugDraw:
     def __init__(self, scene):
         self._scene = scene
+        self._tinted_ghost_models = {}
 
     def clear(self):
         self._scene.clear()
 
     def point(self, points, color=(1.0, 0.0, 0.0, 1.0), size: float = 5.0):
-        pts = self._to_numpy(points)
+        pts = self._as_array(points)
         if pts.ndim == 1:
             pts = pts[None, :]
-        radius = self._point_radius(size)
-        rgba = self._clamp_color(color)
+        rgba = self._rgba_color(color)
         for p in pts:
-            self._scene.add_sphere(p, radius=radius, color=rgba)
+            self._scene.add_sphere(p, radius=0.001 * size, color=rgba)
 
     def vector(self, starts, vectors, color=(1.0, 0.0, 0.0, 1.0), width: float | None = None):
-        s = self._to_numpy(starts)
-        v = self._to_numpy(vectors)
+        s = self._as_array(starts)
+        v = self._as_array(vectors)
         if s.ndim == 1:
             s = s[None, :]
         if v.ndim == 1:
             v = v[None, :]
         if s.shape[0] != v.shape[0]:
             raise ValueError("vector(): starts and vectors must have matching batch size.")
-        rgba = self._clamp_color(color)
-        arrow_width = width if width is not None else self._arrow_width()
+        rgba = self._rgba_color(color)
+        arrow_width = width if width is not None else 0.01
         for start, vec in zip(s, v):
             end = start + vec
             self._scene.add_arrow(start, end, color=rgba, width=arrow_width)
 
-    def _to_numpy(self, array):
-        if isinstance(array, torch.Tensor):
-            return array.detach().cpu().numpy()
-        return np.asarray(array)
+    def ghost(
+        self,
+        qpos,
+        model,
+        mocap_pos=None,
+        mocap_quat=None,
+        alpha: float = 0.5,
+        color=None,
+        geom_groups=(0, 1, 2),
+    ):
+        qpos = self._as_array(qpos)
+        model = self._ghost_model(model, color, geom_groups)
+        if qpos.ndim == 1:
+            self._scene.add_ghost_mesh(
+                qpos,
+                model,
+                mocap_pos=mocap_pos,
+                mocap_quat=mocap_quat,
+                alpha=alpha,
+            )
+            return
+        for qpos_i in qpos:
+            self._scene.add_ghost_mesh(
+                qpos_i,
+                model,
+                mocap_pos=mocap_pos,
+                mocap_quat=mocap_quat,
+                alpha=alpha,
+            )
 
-    def _clamp_color(self, color):
-        return tuple(float(max(0.0, min(1.0, c))) for c in color)
+    def env_indices(self, num_envs: int):
+        return self._scene.get_env_indices(num_envs)
 
-    def _point_radius(self, size: float) -> float:
-        meansize = self._scene.meansize
-        return meansize * 0.001 * size
+    def _ghost_model(self, model, color, geom_groups):
+        if color is None and geom_groups is None:
+            return model
+        rgb = self._rgba_color(color)[:3] if color is not None else None
+        groups = None if geom_groups is None else tuple(int(group) for group in geom_groups)
+        key = (id(model), rgb, groups)
+        if key not in self._tinted_ghost_models:
+            tinted_model = copy.deepcopy(model)
+            if rgb is not None:
+                tinted_model.geom_rgba[:, :3] = rgb
+            if groups is not None:
+                allowed_groups = set(groups)
+                for geom_id in range(tinted_model.ngeom):
+                    if int(tinted_model.geom_group[geom_id]) not in allowed_groups:
+                        tinted_model.geom_rgba[geom_id, 3] = 0.0
+            self._tinted_ghost_models[key] = tinted_model
+        return self._tinted_ghost_models[key]
 
-    def _arrow_width(self) -> float:
-        return self._scene.meansize * 0.01
+    def _as_array(self, array):
+        if hasattr(array, "ndim"):
+            return array
+        return torch.as_tensor(array)
+
+    def _rgba_color(self, color):
+        rgba = tuple(color[:4])
+        if len(rgba) == 3:
+            rgba = (*rgba, 1.0)
+        return tuple(float(max(0.0, min(1.0, c))) for c in rgba)
 
 class ObsGroup:
     
@@ -83,7 +150,7 @@ class ObsGroup:
         self,
         env,
         name: str,
-        funcs: Dict[str, mdp.Observation],
+        funcs: Dict[str, Observation],
         max_delay: int = 0,
     ):
         self.env = env
@@ -139,7 +206,7 @@ class ObsGroup:
         return transform
 
 class RewardGroup:
-    def __init__(self, env, name: str, funcs: OrderedDict[str, mdp.Reward], scale: list[float] | None = None):
+    def __init__(self, env, name: str, funcs: OrderedDict[str, Reward], scale: list[float] | None = None):
         self.env = env
         self.name = name
         self.funcs = funcs
@@ -190,7 +257,6 @@ class _Env(EnvBase):
         self.backend = active_adaptation.get_backend()
         self.device = f"cuda:{active_adaptation.get_local_rank()}"
         self.viewer: Optional[object] = None
-        self.visualizer: Optional[object] = None
         self.debug_draw = _NullDebugDraw()
         self.setup_scene()
         self.setup_viewer()
@@ -221,8 +287,7 @@ class _Env(EnvBase):
         self.reward_spec = Composite(
             {
                 "stats": {
-                    "episode_len": UnboundedContinuous([self.num_envs, 1]),
-                    "success": UnboundedContinuous([self.num_envs, 1]),
+                    "episode_len": UnboundedContinuous([self.num_envs, 1])
                 },
             },
             shape=[self.num_envs]
@@ -230,29 +295,26 @@ class _Env(EnvBase):
 
         self.student_train = bool(self.cfg.student_train)
 
-        members = dict(inspect.getmembers(self.__class__, inspect.isclass))
-        self.command_manager: mdp.Command = hydra.utils.instantiate(self.cfg.command, env=self)
+        self.command_manager: Command = hydra.utils.instantiate(self.cfg.command, env=self)
         self.command_manager.before_update()
         self.command_manager.update()
 
-        RAND_FUNCS = mdp.RAND_FUNCS
-        RAND_FUNCS.update(mdp.get_obj_by_class(members, mdp.Randomization))
-        OBS_FUNCS = mdp.OBS_FUNCS
-        OBS_FUNCS.update(mdp.get_obj_by_class(members, mdp.Observation))
-        REW_FUNCS = mdp.REW_FUNCS
-        REW_FUNCS.update(mdp.get_obj_by_class(members, mdp.Reward))
-        TERM_FUNCS = mdp.TERM_FUNCS
-
         for k, v in inspect.getmembers(self.command_manager):
-            if getattr(v, "is_reward", False):
-                REW_FUNCS[k] = mdp.reward_wrapper(v)
-            elif getattr(v, "is_observation", False):
+            if hasattr(v, "_mdp_randomization_method"):
+                RAND_REGISTRY[k] = randomization_wrapper(
+                    v,
+                    hook=v._mdp_randomization_method,
+                    error_name=k,
+                )
+            if getattr(v, "_mdp_reward_method", False):
+                REW_REGISTRY[k] = reward_wrapper(v, error_name=k)
+            elif getattr(v, "_mdp_observation_method", False):
                 name = v.__func__.__name__
                 name_sym = f"{name}_sym"
                 sym_func = getattr(self.command_manager, name_sym)
-                OBS_FUNCS[k] = mdp.observation_wrapper(v, sym_func)
-            elif getattr(v, "is_termination", False):
-                TERM_FUNCS[k] = mdp.termination_wrapper(v)
+                OBS_REGISTRY[k] = observation_wrapper(v, sym_func, error_name=k)
+            elif getattr(v, "_mdp_termination_method", False):
+                TERM_REGISTRY[k] = termination_wrapper(v, error_name=k)
 
         self.randomizations = OrderedDict()
         self.observation_funcs: Dict[str, ObsGroup] = OrderedDict()
@@ -269,7 +331,7 @@ class _Env(EnvBase):
         self._reset_callbacks.append(self.command_manager.reset)
         self._debug_draw_callbacks.append(self.command_manager.debug_draw)
         
-        self.action_manager: mdp.ActionManager = hydra.utils.instantiate(self.cfg.action, env=self)
+        self.action_manager: ActionManager = hydra.utils.instantiate(self.cfg.action, env=self)
         self._reset_callbacks.append(self.action_manager.reset)
         self._debug_draw_callbacks.append(self.action_manager.debug_draw)
         
@@ -282,7 +344,7 @@ class _Env(EnvBase):
 
 
         for key, params in self.cfg.randomization.items():
-            rand = RAND_FUNCS[key](self, **params if params is not None else {})
+            rand = RAND_REGISTRY[key](self, **params if params is not None else {})
             self.randomizations[key] = rand
             self._startup_callbacks.append(rand.startup)
             self._reset_callbacks.append(rand.reset)
@@ -296,7 +358,25 @@ class _Env(EnvBase):
                 raise NotImplementedError
             funcs = OrderedDict()            
             for key, kwargs in params.items():
-                obs = OBS_FUNCS[key](self, **(kwargs if kwargs is not None else {}))
+                kwargs = kwargs if kwargs is not None else {}
+                if key.startswith("domain_"):
+                    rand_name = key[len("domain_"):]
+                    if rand_name not in self.randomizations:
+                        raise KeyError(
+                            f"Observation '{key}' refers to randomization '{rand_name}', but it is not configured."
+                        )
+                    rand = self.randomizations[rand_name]
+                    if not rand.has_observation():
+                        raise ValueError(
+                            f"Observation '{key}' refers to randomization '{rand_name}', but it does not expose an observation interface."
+                        )
+                    obs = observation_wrapper(
+                        rand.observe,
+                        rand.observe_sym,
+                        error_name=rand_name,
+                    )(self, **kwargs)
+                else:
+                    obs = OBS_REGISTRY[key](self, **kwargs)
                 funcs[key] = obs
 
                 self._startup_callbacks.append(obs.startup)
@@ -327,7 +407,7 @@ class _Env(EnvBase):
             self._stats_ema[group_name] = {}
 
             for key, params in func_specs.items():
-                reward: mdp.Reward = REW_FUNCS[key](self, **params)
+                reward: Reward = REW_REGISTRY[key](self, **params)
                 funcs[key] = reward
                 reward_spec["stats", group_name, key] = UnboundedContinuous(1, device=self.device)
                 self._update_callbacks.append(reward.update)
@@ -358,7 +438,11 @@ class _Env(EnvBase):
 
         self.termination_funcs = OrderedDict()
         for key, params in self.cfg.termination.items():
-            term_func = TERM_FUNCS[key](self, **params)
+            params = dict(params) if params is not None else {}
+            termination_type = params.pop("termination_type", None)
+            term_func = TERM_REGISTRY[key](self, **params)
+            if termination_type is not None:
+                term_func.set_termination_type(termination_type)
             self.termination_funcs[key] = term_func
             self._update_callbacks.append(term_func.update)
             self._reset_callbacks.append(term_func.reset)
@@ -409,7 +493,7 @@ class _Env(EnvBase):
             # reset things in simulation
             self._reset_idx(env_ids)
             # reset episode length buffer
-            self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length // 10, (env_ids.numel(),), device=self.device)
+            self.episode_length_buf[env_ids] = 0
 
         # reset mdp
         for callback in self._reset_callbacks:
@@ -452,19 +536,21 @@ class _Env(EnvBase):
         rewards = torch.cat(rewards, 1)
 
         self.stats["episode_len"][:] = self.episode_length_buf.unsqueeze(1)
-        self.stats["success"][:] = (self.episode_length_buf >= self.max_episode_length * 0.9).unsqueeze(1).float()
         return {"reward": rewards}
     
-    def _compute_termination(self) -> TensorDictBase:
+    def _compute_termination(self) -> tuple[torch.Tensor, torch.Tensor]:
+        terminated = torch.zeros((self.num_envs, 1), dtype=bool, device=self.device)
+        truncated = torch.zeros((self.num_envs, 1), dtype=bool, device=self.device)
         if not self.termination_funcs:
-            return torch.zeros((self.num_envs, 1), dtype=bool, device=self.device)
-        flags = []
+            return terminated, truncated
         for key, func in self.termination_funcs.items():
             flag = func()
             self.stats["termination", key][:] = flag.float()
-            flags.append(flag)
-        flags = torch.cat(flags, dim=-1)
-        return flags.any(dim=-1, keepdim=True)
+            if func.termination_type == "truncated":
+                truncated = truncated | flag
+            else:
+                terminated = terminated | flag
+        return terminated, truncated
 
     def _update(self):
         for callback in self._update_callbacks:
@@ -517,11 +603,8 @@ class _Env(EnvBase):
         self._compute_observation(tensordict)
 
         # update termination
-        terminated = self._compute_termination()
+        terminated, truncated = self._compute_termination()
         terminated = terminated & (self.episode_length_buf > 5).unsqueeze(1) # do not terminate in the first 5 steps
-        truncated = (self.episode_length_buf >= self.max_episode_length).unsqueeze(1)
-        if hasattr(self.command_manager, "finished"):
-            truncated = truncated | self.command_manager.finished.unsqueeze(1)
         tensordict.set("terminated", terminated)
         tensordict.set("truncated", truncated)
         tensordict.set("done", terminated | truncated)
@@ -544,8 +627,7 @@ class _Env(EnvBase):
 
     def render(self, mode: str = "human"):
         if mode == "human":
-            self._update_viewer(force_sync=True)
-            breakpoint()
+            self._update_viewer()
             return None
         raise NotImplementedError
     
@@ -565,49 +647,38 @@ class _Env(EnvBase):
 
         try:
             import viser
-            from mjlab.viewer.viser.scene import ViserMujocoScene
+            from mjlab.viewer.viser.scene import MjlabViserScene
         except Exception as exc:
             print(f"[WARN] Viser viewer not available ({exc}).")
             return
 
         try:
             self.viewer = viser.ViserServer(label="gmt")
-            self._viser_scene = ViserMujocoScene.create(
+            self._viser_scene = MjlabViserScene(
                 server=self.viewer,
                 mj_model=self.sim.mj_model,
                 num_envs=self.num_envs,
             )
-            self._viser_scene.create_visualization_gui()
             self._viser_scene.debug_visualization_enabled = True
+            self._viser_scene.show_all_envs = True
             self._viser_scene.camera_tracking_enabled = False
+            self._viser_scene.create_visualization_gui(
+                camera_distance=3.0,
+                camera_azimuth=45.0,
+                camera_elevation=30.0,
+            )
             self._viewer_enabled = True
             self.debug_draw = _ViserDebugDraw(self._viser_scene)
             print("[INFO] Viser viewer launched.")
         except Exception as exc:
             print(f"[WARN] Failed to launch Viser viewer: {exc}")
 
-    def _update_viewer(self, force_sync: bool = False) -> None:
+    def _update_viewer(self) -> None:
         if not self._viewer_enabled or self.viewer is None:
             return
         if not hasattr(self.sim, "data"):
             return
-        wp_data = self.sim.data
-        try:
-            device = getattr(wp_data.xpos, "device", None)
-            if device is not None and device.type != "cpu":
-                from types import SimpleNamespace
-
-                wp_data = SimpleNamespace(
-                    xpos=wp_data.xpos.detach().cpu(),
-                    xmat=wp_data.xmat.detach().cpu(),
-                    mocap_pos=wp_data.mocap_pos.detach().cpu(),
-                    mocap_quat=wp_data.mocap_quat.detach().cpu(),
-                    qpos=wp_data.qpos.detach().cpu(),
-                    qvel=wp_data.qvel.detach().cpu(),
-                )
-        except Exception:
-            pass
-        self._viser_scene.update(wp_data)
+        self._viser_scene.update(self.sim.data)
 
     def _has_gui(self) -> bool:
         return self._viewer_enabled and self.viewer is not None
@@ -639,6 +710,9 @@ class _Env(EnvBase):
             self.command_manager.step_schedule(progress, iters)
         if hasattr(self.action_manager, "step_schedule"):
             self.action_manager.step_schedule(progress, iters)
+        for rand in self.randomizations.values():
+            if hasattr(rand, "step_schedule"):
+                rand.step_schedule(progress, iters)
         for rew in self.reward_groups.values():
             if hasattr(rew, "step_schedule"):
                 rew.step_schedule(progress, iters)

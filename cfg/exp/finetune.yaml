@@ -20,6 +20,6 @@ task:
   reward:
     loco:
       action_rate_l2:     {weight: 0.1, enabled: true}
-      joint_acc_l2:       {weight: 5.0e-7, enabled: true, joint_names: .*}
+      # joint_acc_l2:       {weight: 2.5e-7, enabled: true, joint_names: .*}
 
-total_frames: 4000_000_000
+total_frames: 2000_000_000

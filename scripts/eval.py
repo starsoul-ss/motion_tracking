@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-r", "--run_path", type=str)
     parser.add_argument("--task", type=str, default=None)
+    parser.add_argument("--profile", type=str, default=None)
     parser.add_argument("-p", "--play", action="store_true", default=False)
     # whether to override terrain and command
     parser.add_argument("-t", "--terrain", action="store_true", default=False)
@@ -49,24 +50,19 @@ def main():
     cfg["checkpoint_path"] = download.checkpoint_path
     cfg["vecnorm"] = "eval"
 
+    if args.task is not None:
+        saved_student_train = OmegaConf.select(cfg, "task.student_train", default=None)
+        with hydra.initialize(config_path="../cfg", job_name="eval", version_base=None):
+            overrides = [f"task={args.task}"]
+            if args.profile is not None:
+                overrides.append(f"task/profile={args.profile}")
+            _cfg = hydra.compose(config_name="eval", overrides=overrides)
+        cfg["task"] = _cfg.task
+        if saved_student_train is not None:
+            cfg["task"]["student_train"] = saved_student_train
+
     if args.teleop:
         cfg["task"]["command"]["teleop"] = True
-
-    if args.task is not None:
-        with hydra.initialize(config_path="../cfg", job_name="eval", version_base=None):
-            _cfg = hydra.compose(config_name="eval", overrides=[f"task={args.task}"])
-        # cfg["task"]["randomization"] = _cfg.task.randomization
-        cfg["task"]["reward"] = _cfg.task.reward
-        cfg["task"]["termination"] = _cfg.task.termination
-        cfg["task"]["observation"] = _cfg.task.observation
-        cfg["task"]["action"] = _cfg.task.action
-        cfg["task"]["randomization"] = _cfg.task.randomization
-        cfg["task"]["robot"] = _cfg.task.robot
-        if args.terrain:
-            cfg["task"]["terrain"] = _cfg.task.terrain
-        if args.command:
-            cfg["task"]["command"] = _cfg.task.command
-        cfg["task"]["flags"] = _cfg.task.flags
     
     if args.play:
         if not args.success:

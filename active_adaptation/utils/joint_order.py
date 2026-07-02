@@ -3,8 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
-import mjlab.utils.lab_api.string as string_utils
-
 
 def _normalize_patterns(joint_names: str | Sequence[str]) -> list[str]:
     if isinstance(joint_names, str):
@@ -59,14 +57,20 @@ def resolve_joint_order_with_values(
     asset,
     values_map: dict[str, Any],
     joint_names: str | Sequence[str] = ".*",
-    preserve_order: bool = False,
 ) -> tuple[list[int], list[str], list[Any]]:
     """Resolve joint ids/names/values using canonical joint order."""
     order = get_joint_name_order(asset)
     filtered = _filter_order(order, joint_names)
-    _, names, values = string_utils.resolve_matching_names_values(
-        dict(values_map), filtered, preserve_order=preserve_order
-    )
+
+    names: list[str] = []
+    values: list[Any] = []
+    for name in filtered:
+        for pattern, value in values_map.items():
+            if re.fullmatch(pattern, name):
+                names.append(name)
+                values.append(value)
+                break
+
     name_to_id = {name: idx for idx, name in enumerate(asset.joint_names)}
     missing = [name for name in names if name not in name_to_id]
     if missing:

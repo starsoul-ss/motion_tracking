@@ -155,6 +155,8 @@ def make_env_policy(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
     from active_adaptation.envs import SimpleEnv
     from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, StepCounter
+    torch.manual_seed(int(cfg.seed))
+    aa.print(f"Set torch seed before env construction: {int(cfg.seed)}")
     # Propagate top-level/app headless flag into task.viewer for MJLab GUI.
     if "app" in cfg and "headless" in cfg.app:
         cfg.task.viewer.headless = cfg.app.headless
@@ -233,7 +235,6 @@ def make_env_policy(cfg: DictConfig):
     aa.print("create VecNorm done")
 
     env = TransformedEnv(base_env, transform)
-    env.set_seed(cfg.seed)
     aa.print("TransformedEnv done")
     
     # setup policy

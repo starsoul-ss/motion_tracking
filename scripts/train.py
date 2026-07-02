@@ -61,8 +61,6 @@ def main(cfg: DictConfig):
     total_iters = total_frames // frames_per_batch
     save_interval = cfg.get("save_interval", -1)
     start_iter = cfg.get("start_iter", 0)
-    start_frame = start_iter * frames_per_batch
-
     need_logging = aa.is_main_process() and cfg.wandb.get("mode", "disabled") != "disabled"
     if need_logging:
         default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
@@ -117,10 +115,11 @@ def main(cfg: DictConfig):
     carry = env.reset()
 
     assert env.training
+    iter_range = range(start_iter, total_iters)
     if aa.is_main_process():
-        progress = tqdm(range(total_iters))
+        progress = tqdm(iter_range)
     else:
-        progress = range(total_iters)
+        progress = iter_range
 
     N = env.num_envs
     T = cfg.algo.train_every
@@ -140,7 +139,7 @@ def main(cfg: DictConfig):
             output_dir=record_output_dir,
             seed=int(cfg.seed),
             start_iter=int(start_iter),
-            enabled=True,
+            enabled=bool(train_record_cfg.get("enabled", True)),
         )
 
     for i in progress:
@@ -155,7 +154,7 @@ def main(cfg: DictConfig):
 
                 td, carry = env.step_and_maybe_reset(carry)
                 if train_recorder is not None:
-                    rollout_step = (start_iter + i) * cfg.algo.train_every + t
+                    rollout_step = i * cfg.algo.train_every + t
                     train_recorder.on_step(i, rollout_step)
 
                 # deal with value
@@ -168,9 +167,20 @@ def main(cfg: DictConfig):
                 )
 
                 # clean up tensordict
-                td["next"] = td["next"].exclude(*rollout_policy.in_keys)
-                private_keys = [key for key in td.keys(True, True) if isinstance(key, str) and key.startswith('_')]
-                td = td.exclude(*private_keys, "priv_pred", "priv_feature")
+                td["next"] = td["next"].select("reward", "done", "terminated", "state_value", "stats", strict=False)
+                td = td.select(
+                    "policy",
+                    "priv",
+                    "priv_critic",
+                    "action",
+                    "action_log_prob",
+                    "loc",
+                    "scale",
+                    "is_init",
+                    "state_value",
+                    "next",
+                    strict=False,
+                )
 
                 data_buf.write_step(t, td)
 
@@ -179,12 +189,14 @@ def main(cfg: DictConfig):
         rollout_time = time.perf_counter() - start
         training_start = time.perf_counter()
 
+        progress_ratio = i / total_iters
         if hasattr(policy, "step_schedule"):
-            policy.step_schedule(i / total_iters, i)
+            policy.step_schedule(progress_ratio, i)
         if hasattr(env, "step_schedule"):
-            env.step_schedule(i / total_iters, i)
+            env.step_schedule(progress_ratio, i)
         
         train_carry = policy.train_op(data, vecnorm)
+        training_time = time.perf_counter() - training_start
 
         if need_logging:
             info = {}
@@ -202,7 +214,7 @@ def main(cfg: DictConfig):
 
             info["env_frames"] = env_frames * aa.get_world_size()
             info["rollout_fps"] = data.numel() / rollout_time * aa.get_world_size()
-            info["training_time"] = time.perf_counter() - training_start
+            info["training_time"] = training_time
         
             if save_interval and save_interval > 0 and should_save(i):
                 save(policy, f"checkpoint_{i}")
@@ -219,7 +231,7 @@ def main(cfg: DictConfig):
 
             policy_eval = policy.get_rollout_policy("eval")
             info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
-            run.log(info, step = total_iters)
+            run.log(info, step=total_iters)
 
             finish_wandb_run(run)
     exit(0)

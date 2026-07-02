@@ -1,120 +1,244 @@
-# Whole Body Motion Tracking
+# Motion Tracking
 
-This repository contains the training, evaluation, and deployment assets for a whole-body motion tracking policy built on top of the [GentleHumanoid](https://gentle-humanoid.axell.top) codebase.
+[![HEFT Website](https://img.shields.io/badge/Website-heft.axell.top-0A66C2)](https://heft.axell.top/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+![Python 3.10](https://img.shields.io/badge/Python-3.10-blue.svg)
+![mjlab 1.3.0](https://img.shields.io/badge/mjlab-1.3.0-orange.svg)
 
-The main focus of this repository is:
+This repository contains training, evaluation, export, and deployment-facing assets for
+humanoid whole-body motion tracking.
 
-* training a **universal**, **robust**, and **highly dynamic** whole-body motion tracking policy,
-* supporting upper-body **compliance-aware** behavior for contact-rich interaction,
-* supporting robust live **VR teleoperation** through a separate teleop stack.
+> **Branch guide**
+>
+> - The **main branch** is the official implementation of
+>   [HEFT: Heavy-Payload Full-size Humanoid Teleoperation with Privileged Motion
+>   Guidance and Windowed Payload Curriculum](https://heft.axell.top/).
+> - The **compliance branch** contains a G1 tracking + compliance framework inspired by
+>   Gentle humanoid. [Demo](https://motion-tracking.axell.top/).
+> - The **sim2real branch** provides the deployment runtime and available checkpoints.
 
-The simulation and training backend is based on **mjlab**.
+The simulation and training utilities are based on **mjlab**.
 
-A demo of the pretrained policy, showing one model generalizing across diverse and highly dynamic motions, is available [here](https://motion-tracking.axell.top).
+## Repository Structure
 
-https://github.com/user-attachments/assets/263dd3cc-8d23-4d67-bd36-37fe89f525de
+To train HEFT G1/L7 policies, clone the default `main` branch:
 
-https://github.com/user-attachments/assets/4d210dbf-8023-4270-b094-ab6a2353deda
+```bash
+git clone https://github.com/Axellwppr/motion_tracking.git
+cd motion_tracking
+```
 
-Instructions for deployment and runtime usage are available in the [`sim2real`](./sim2real) folder.
+To deploy released policies, clone the `sim2real` branch:
+
+```bash
+git clone -b sim2real --single-branch https://github.com/Axellwppr/motion_tracking.git motion_tracking_sim2real
+cd motion_tracking_sim2real
+```
+
+To use the G1 compliance framework, clone the `compliance` branch:
+
+```bash
+git clone -b compliance --single-branch https://github.com/Axellwppr/motion_tracking.git motion_tracking_compliance
+cd motion_tracking_compliance
+```
+
+## Release Status
+
+HEFT consists of an efficient humanoid motion tracking framework, PMG
+(Privileged Motion Guidance), and WPC (Windowed Payload Curriculum).
+
+- [x] Efficient motion tracking training framework
+- [x] PMG (Privileged Motion Guidance) support
+- [x] WPC (Windowed Payload Curriculum) support
+- [x] Released checkpoints on the `sim2real` branch
+- [x] Deployment runtime on the `sim2real` branch
+- [ ] Public training datasets and WPC window-payload labels
+- [ ] VR data recording, reference reconstruction, and paired-dataset generation workflow
 
 ## Installation
 
-If you do not have `uv` installed, you can install it following the instructions in the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
+This project uses `uv` for Python dependency and environment management. If you do not
+have `uv` installed, follow the
+[uv installation guide](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-# this project uses uv for dependency and environment management
 uv sync
 ```
 
-## Motion Dataset Preparation
+## Dataset Layout
 
-<details>
-<summary><b>Quick Start: Download Preprocessed Dataset (Google Drive)</b></summary>
+Training loads motion memdatasets from `dataset/` by default. You can override the
+dataset root with the `MEMPATH` environment variable:
 
-Download link:
+```bash
+export MEMPATH=/path/to/motion_tracking_dataset
+```
 
-- [Google Drive Dataset](https://drive.google.com/drive/folders/1-FBUxllaYwqGIUSCaWg_4inD-u5Tdvi9?usp=sharing)
-
-After downloading, extract it into the repository `dataset/` directory, and you should have the following structure:
+The profile files reference paths relative to `MEMPATH`, for example:
 
 ```text
 dataset/
-  amass_all/
-    meta.json
-    ...
-  lafan_all/
-    ...
+  g1/
+    lafan/
+    100style/
+    seed/all/
+    vr_paired/
+      clean/
+      raw/
+  l7/
+    lafan/
+    100style/
+    seed/all/
+    vr_paired/
+      clean/
+      raw/
 ```
 
-</details>
+The paired `vr_paired/{clean,raw}` folders are used by PMG. The clean side is used as
+the teacher/reference target, while the raw side represents deployable student input.
 
-<details>
-<summary><b>Build Dataset from AMASS/LAFAN with GMR</b></summary>
+We provide some preprocessed G1 memdatasets for smoke-testing the
+training pipeline:
+[Google Drive dataset](https://drive.google.com/drive/folders/1-FBUxllaYwqGIUSCaWg_4inD-u5Tdvi9?usp=sharing).
+After downloading, place the extracted folders under `dataset/g1/` or set `MEMPATH` to
+the extracted dataset root. These samples are not the exact HEFT training set, but they
+are useful for validating the framework and obtaining similar training behavior. The
+full dataset will be released later.
 
-### Retargeting with GMR
+## Build A Motion Dataset
 
-We use GMR to retarget the [AMASS](https://amass.is.tue.mpg.de/) and [LAFAN](https://github.com/ubisoft/ubisoft-laforge-animation-dataset) datasets. The output format is a dataset containing a series of npz files with the following fields:
+The dataset builder consumes retargeted robot `npz` files and writes a memdataset:
 
-- `fps`: Frame rate
-- `root_pos`: Root position
-- `root_rot`: Root rotation in quaternion format (xyzw)
-- `dof_pos`: Degrees of freedom positions
-- `local_body_pos`: Local body positions
-- `local_body_rot`: Local body rotations
-- `body_names`: List of body names
-- `joint_names`: List of joint names
+Each `npz` should follow the GMR-style robot motion format at 50 Hz. The required
+fields are `root_pos`, `root_rot` in `xyzw` quaternion order, `dof_pos`,
+`local_body_pos`, `joint_names`, and `body_names`. You can use the
+[modified GMR exporter](https://github.com/Axellwppr/GMR) to generate compatible
+retargeted motions.
 
-You can use the [modified version of GMR](https://github.com/Axellwppr/GMR) to directly export npz files that meet the requirements.
-
-You should organize the processed datasets in the following structure:
-```
-<dataset_root>/
-    AMASS/ACCAD/Female1General_c3d/A1_-_Stand_stageii.npz
-    ...
-    LAFAN/walk1_subject1.npz
-    ...
+```bash
+uv run python scripts/data_process/generate_dataset.py \
+  --dataset-root /path/to/retargeted_npz \
+  --mem-path dataset/g1/my_motion_set
 ```
 
-### Dataset Building
+For paired PMG data, provide both clean teacher motions and raw student motions:
 
-Modify `DATASET_ROOT` in `generate_dataset.sh` to point to your dataset root directory, then run the script to generate the dataset:
+```bash
+uv run python scripts/data_process/generate_dataset.py \
+  --dataset-root /path/to/clean_npz \
+  --mem-path dataset/g1/vr_paired/clean \
+  --student-root /path/to/raw_npz \
+  --student-mem-path dataset/g1/vr_paired/raw
 ```
-bash generate_dataset.sh
-```
 
-The dataset will be generated in the `dataset/` directory, and the code will automatically load these datasets. You can also use the `MEMATH` environment variable to specify the dataset root path.
+If you write to `dataset/g1/my_motion_set`, use `g1/my_motion_set` in the YAML profile.
+If you write under another root, set `MEMPATH` before training.
 
-</details>
+## Configure Training
+
+Robot-specific training settings live in:
+
+- `cfg/task/profile/G1_tracking.yaml`
+- `cfg/task/profile/L7_tracking.yaml`
+
+The most common changes are:
+
+- dataset groups under `command.dataset.groups`
+- dataset weights
+- whether the `vr_paired` group is enabled
+- `student_motion_randomization.enable`
+- action/noise/randomization ranges for a specific robot
+
+For PMG training with paired clean/raw data:
+
+1. Enable the `vr_paired` dataset group.
+2. Set `student_motion_randomization.enable: false`.
+
+If paired PMG data is unavailable:
+
+1. Leave the paired group commented out.
+2. Keep `student_motion_randomization.enable: true`.
+
+L7 WPC support is configured through `cfg/load/l7_wpc.yaml`, but the public WPC payload
+labels and datasets are planned for a later release.
 
 ## Training
 
-You can use the provided `train.sh` script to run the full training pipeline. Modify the global configuration section in `train.sh` to set your WandB account and other parameters, then run:
+Use `train.sh` as the main entry point. Edit the global configuration at the top of the
+file, especially:
+
+- `PROJECT`
+- `NPROC`
+- the final `run_pipeline` line
+
+For G1:
+
+```bash
+run_pipeline "G1_tracking" "g1_track" "release"
+```
+
+For L7:
+
+```bash
+run_pipeline "L7_tracking" "l7_track" "release"
+```
+
+Then run:
 
 ```bash
 bash train.sh
 ```
 
-Under standard settings, training takes approximately 15 hours on 4× A100 GPUs.
-If GPU memory is constrained, it is recommended to appropriately tune the `NPROC` and `num_envs` parameters in `train.sh` and `cfg/task/G1/G1.yaml`, respectively.
-Such adjustments may increase training time and could affect training performance to some extent.
+`train.sh` runs the full three-stage pipeline:
 
-## Evaluation
+1. `+exp=train`
+2. `+exp=adapt`, initialized from the train run
+3. `+exp=finetune`, initialized from the adapt run
+
+With 8*8192 envs, training takes roughly 6 hours on 8 PRO6000 GPUs. If GPU memory
+is constrained, reduce `NPROC` in `train.sh` and `num_envs` in
+`cfg/task/common/base.yaml`. Reducing the total number of environments or the training
+budget may significantly affect final performance.
+
+## Evaluation And Export
+
+Each stage saves a checkpoint every 150 iterations. During or after training, you can
+use `eval.py` to evaluate checkpoint performance or export a deployment policy.
+
+Play a trained policy:
 
 ```bash
-uv run scripts/eval.py --run_path ${wandb_run_path} -p # p for play
-uv run scripts/eval.py --run_path ${wandb_run_path} -p --export # export the policy to onnx (sim2real)
+uv run python scripts/eval.py --run_path ${wandb_run_path} -p
 ```
 
-If you export a deployment policy, the exported checkpoint will be written under `scripts/exports/<task-name>-<timestamp>/`.
+Export a deployment policy:
 
-To use it in the deployment runtime:
+```bash
+uv run python scripts/eval.py --run_path ${wandb_run_path} -p --export
+```
 
-1. Copy the exported policy folder (including `policy.onnx`, `policy.pt`, and `policy.json`) into `sim2real/assets/ckpts/`.
-2. Update `sim2real/config/tracking.yaml` so that `policy_path` points to the new ONNX file.
+Evaluate with an explicit profile:
 
-For the actual deployment-side test procedure:
+```bash
+uv run python scripts/eval.py --run_path ${wandb_run_path} --task tracking --profile L7_tracking -p
+```
 
-- see [`sim2real/README.md`](./sim2real/README.md) for `sim2sim/sim2real` testing
+Exported policies are written under:
 
-That README also explains how to use the UDP motion selector and the VR motion source during deployment.
+```text
+scripts/exports/<task-name>-<timestamp>/
+```
+
+The exported folder contains the policy artifacts needed by the deployment runtime,
+including `policy.onnx`, `policy.pt`, and `policy.json`.
+
+## Deployment
+
+Deployment assets are provided on the `sim2real` branch:
+
+```bash
+git clone -b sim2real --single-branch https://github.com/Axellwppr/motion_tracking.git motion_tracking_sim2real
+```
+
+That branch contains the deployment runtime, sim2sim/sim2real configuration, and
+released policy assets.

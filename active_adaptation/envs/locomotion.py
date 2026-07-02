@@ -3,6 +3,7 @@ import torch
 import active_adaptation
 from active_adaptation.envs.base import _Env
 
+
 class SimpleEnv(_Env):
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -28,6 +29,21 @@ class SimpleEnv(_Env):
 
         scene_cfg.terrain = TerrainEntityCfg(
             terrain_type="plane",
+            terrain_generator=TerrainGeneratorCfg(
+                size=(5.0, 5.0),
+                border_width=20.0,
+                num_rows=8,
+                num_cols=8,
+                sub_terrains={
+                    "boxes": terrain_gen.BoxRandomGridTerrainCfg(
+                        proportion=1.0,
+                        grid_width=0.5,
+                        grid_height_range=(0.001, 0.005),
+                        platform_width=0.5,
+                    ),
+                },
+                add_lights=False,
+            ),
             env_spacing=env_spacing,
             num_envs=self.cfg.num_envs,
         )
@@ -35,6 +51,12 @@ class SimpleEnv(_Env):
         from active_adaptation.assets import get_robot_cfg
 
         scene_cfg.entities["robot"] = get_robot_cfg(self.cfg.robot.name)
+
+        mjlab_dt = self.cfg.sim.get("mjlab_physics_dt", None)
+        if mjlab_dt is None:
+            mjlab_dt = self.cfg.sim.get("mujoco_physics_dt", None)
+        step_dt = self.cfg.sim.get("step_dt", mjlab_dt)
+        contact_history_length = max(int(round(float(step_dt) / float(mjlab_dt))), 1)
 
         # contact_cfg = ContactSensorCfg(
         #     name="contact_forces",
@@ -65,10 +87,6 @@ class SimpleEnv(_Env):
         )
 
         scene_cfg.sensors = (contact_cfg,)
-
-        mjlab_dt = self.cfg.sim.get("mjlab_physics_dt", None)
-        if mjlab_dt is None:
-            mjlab_dt = self.cfg.sim.get("mujoco_physics_dt", None)
 
         self.sim_cfg = sim_cfg = SimulationCfg(
             nconmax=200,

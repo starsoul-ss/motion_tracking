@@ -1,0 +1,25 @@
+# @package task
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0.0, 0.0, 0.0]
+  eye: [4.0, 4.0, 4.0]
+
+terrain: plane
+
+robot: {}
+
+num_envs: 8192
+max_episode_length: 1000
+student_train: false
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.005
+
+command: {}
+observation: {}
+reward: {}
+randomization: {}
+termination: {}

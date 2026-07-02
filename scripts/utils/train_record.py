@@ -77,7 +77,7 @@ class TrainStateRecorder:
         if not self.enabled or self._session is not None:
             return
 
-        global_iter = self.start_iter + int(iter_idx)
+        global_iter = int(iter_idx)
         if global_iter % self.interval != 0:
             return
 
@@ -128,7 +128,7 @@ class TrainStateRecorder:
         s.root_state[s.cursor] = self._get_root_state()[env_ids].detach().cpu().float().numpy()
         s.joint_pos[s.cursor] = self.asset.data.joint_pos[env_ids].detach().cpu().float().numpy()
         s.joint_vel[s.cursor] = self.asset.data.joint_vel[env_ids].detach().cpu().float().numpy()
-        s.iter_idx[s.cursor] = self.start_iter + int(iter_idx)
+        s.iter_idx[s.cursor] = int(iter_idx)
         s.rollout_step[s.cursor] = int(rollout_step)
         s.cursor += 1
 

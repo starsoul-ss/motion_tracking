@@ -103,6 +103,16 @@ def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 
     return torch.stack((w, x, y, z), dim=-1)
 
+
+@torch.jit.script
+def quat_in_frame(frame_quat: torch.Tensor, quat_w: torch.Tensor) -> torch.Tensor:
+    return quat_mul(quat_conjugate(frame_quat), quat_w)
+
+
+@torch.jit.script
+def quat_delta(current_quat: torch.Tensor, target_quat: torch.Tensor) -> torch.Tensor:
+    return quat_mul(target_quat, quat_conjugate(current_quat))
+
 @torch.jit.script
 def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
     r, i, j, k = torch.unbind(quaternions, -1)
@@ -124,8 +134,13 @@ def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
     )
     return o.reshape(quaternions.shape[:-1] + (3, 3))
 
+
+@torch.jit.script
+def quat_to_rot6d(quaternions: torch.Tensor) -> torch.Tensor:
+    return matrix_from_quat(quaternions)[..., :, :2].transpose(-2, -1)
+
 __all__ = [
     "yaw_quat", "wrap_to_pi", "quat_mul", "quat_conjugate", "quat_from_angle_axis",
-    "quat_apply", "quat_apply_inverse", "axis_angle_from_quat",
-    "clamp_norm", "clamp_along", "normalize", "matrix_from_quat",
+    "quat_apply", "quat_apply_inverse", "axis_angle_from_quat", "quat_in_frame", "quat_delta",
+    "clamp_norm", "clamp_along", "normalize", "matrix_from_quat", "quat_to_rot6d",
 ]

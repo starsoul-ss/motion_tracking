@@ -1,0 +1,35 @@
+# @package _global_
+
+task:
+  profile:
+    randomization:
+      perturb_body_wrench:
+        enabled: false
+      window_cap_hand_load:
+        enabled: true
+        label_path: ${oc.env:L7_WINDOW_LOAD_CAP_LABEL_PATH}
+        body_names:
+          - left_wrist_roll_link
+          - right_wrist_roll_link
+        force_application_body_names:
+          - left_hand_mimic
+          - right_hand_mimic
+        split_ratio_range: [0.35, 0.65]
+        force_cone_half_angle_deg: 12.0
+        transition_duration_s: 1.0
+        predrop_duration_s: 1.0
+        max_load_kg: 30.0
+        cap_curriculum_progress_range: [0.0, 0.8]
+        cap_curriculum_scale_range: [0.0, 1.0]
+        cap_safety_scale: 1.0
+        inertial_force_scale_range: [0.8, 1.2]
+        inertial_accel_tau_s: 0.08
+        inertial_accel_clip_mps2: 15.0
+        force_application_offset_radius_range_m: [0.0, 0.05]
+        hand_force_fraction_range: [0.2, 1.0]
+        window_no_load_ratio: 0.25
+        single_side_load_ratio: 0.25
+        missing_motion_policy: error
+  observation:
+    priv:
+      domain_window_cap_hand_load: {}

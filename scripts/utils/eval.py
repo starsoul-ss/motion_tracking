@@ -7,9 +7,6 @@ import sys
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-
-from active_adaptation.learning import ALGOS
-
 import logging
 from tqdm import tqdm
 from scripts.utils.helpers import make_env_policy, evaluate

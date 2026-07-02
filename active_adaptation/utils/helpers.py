@@ -1,72 +1,65 @@
 import torch
-from functools import wraps
-from typing import Sequence, Dict, Any
-from tensordict import TensorDictBase
-from prettytable import PrettyTable
+from typing import Sequence
 
 
-def table_print(info: Dict[str, Any]):
-    pt = PrettyTable()
-    nrow = max(len(v) for v in info.values())
-    for k, v in info.items():
-        data = [f"{kk}:{vv:.3f}" for kk, vv in v.items()]
-        data += [" "] * (nrow - len(data))
-        pt.add_column(k, data)
-    print(pt)
+class TensorRingBuffer:
+    """Small helper for fixed-size per-env history buffers.
 
+    Storage is kept in `[num_envs, capacity, *value_shape]` layout. New values
+    are written by moving a head pointer instead of shifting the whole buffer.
+    """
 
-def batchify(func, broadcast=True):
-    @wraps(func)
-    def wrapped(*args, **kwargs):
-        batch_shapes = [arg.shape[:-1] for arg in args]
-        if broadcast:
-            batch_shape = torch.broadcast_shapes(*batch_shapes)
-        else:
-            batch_shape = set(batch_shapes)
-            if len(batch_shape) != 1:
-                raise ValueError()
-            batch_shape = batch_shape.pop()
-        args = [
-            arg.expand(*batch_shape, arg.shape[-1]).reshape(-1, arg.shape[-1]) 
-            for arg in args
-        ]
-        ret = func(*args, **kwargs)
-        return ret.reshape(*batch_shape, *ret.shape[1:])
-    return wrapped
+    def __init__(
+        self,
+        num_envs: int,
+        capacity: int,
+        value_shape: int | Sequence[int],
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ):
+        self.num_envs = int(num_envs)
+        self.capacity = int(capacity)
+        if isinstance(value_shape, int):
+            value_shape = (value_shape,)
+        self.value_shape = tuple(int(v) for v in value_shape)
+        self.device = torch.device(device)
+        self.dtype = dtype
 
-class Every:
-    def __init__(self, func, steps):
-        self.func = func
-        self.steps = steps
-        self.i = 0
+        self.buffer = torch.zeros(
+            (self.num_envs, self.capacity, *self.value_shape),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.head = 0
+        self._offsets = torch.arange(self.capacity, device=self.device, dtype=torch.long)
 
-    def __call__(self, *args, **kwargs):
-        if self.i % self.steps == 0:
-            self.func(*args, **kwargs)
-        self.i += 1
+    def reset(self, env_ids: torch.Tensor):
+        self.buffer[env_ids] = 0
 
-class EpisodeStats:
-    def __init__(self, in_keys: Sequence[str] = None):
-        self.in_keys = in_keys
-        self._stats = []
-        self._episodes = 0
+    def push(self, value: torch.Tensor):
+        self.head = (self.head - 1) % self.capacity
+        self.buffer[:, self.head].copy_(value)
 
-    def add(self, tensordict: TensorDictBase) -> TensorDictBase:
-        next_tensordict = tensordict["next"]
-        done = next_tensordict["done"]
-        if done.any():
-            done = done.squeeze(-1)
-            self._episodes += done.sum().item()
-            next_tensordict = next_tensordict.select(*self.in_keys)
-            self._stats.extend(
-                next_tensordict[done].clone().unbind(0)
-            )
-        return len(self)
-    
-    def pop(self):
-        stats: TensorDictBase = torch.stack(self._stats).to_tensordict()
-        self._stats.clear()
-        return stats
+    def take(self, offsets: torch.Tensor) -> torch.Tensor:
+        offsets = offsets.to(device=self.device, dtype=torch.long)
+        idx = (offsets + self.head) % self.capacity
+        return self.buffer.index_select(1, idx)
 
-    def __len__(self):
-        return len(self._stats)
+    def recent(self, steps: int) -> torch.Tensor:
+        steps = min(int(steps), self.capacity)
+        return self.take(self._offsets[:steps])
+
+    def take_per_env(self, offsets: torch.Tensor) -> torch.Tensor:
+        offsets = offsets.to(device=self.device, dtype=torch.long)
+        squeeze_dim = offsets.ndim == 1
+        if squeeze_dim:
+            offsets = offsets.unsqueeze(1)
+
+        idx = (offsets + self.head) % self.capacity
+        index = idx
+        for _ in self.value_shape:
+            index = index.unsqueeze(-1)
+        index = index.expand(idx.shape[0], idx.shape[1], *self.value_shape)
+        values = self.buffer.take_along_dim(index, dim=1)
+        return values.squeeze(1) if squeeze_dim else values
