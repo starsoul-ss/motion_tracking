@@ -264,6 +264,37 @@ class WindowLoadCapacityLookup:
                 f"Capacity labels from {resolved_path} matched {labeled_motion_ids.size}/{num_motions} motions; "
                 f"missing first ids={preview}. Use missing_motion_policy='zero' only if this is intentional."
             )
+        motion_lengths_np = _to_numpy_int64(motion_lengths)
+        # Labels generated before the half-open interval fix used length - 1
+        # for the final end. Normalize them in memory without rewriting artifacts.
+        for motion_id in labeled_motion_ids:
+            idx = np.flatnonzero(mapped.motion_ids == motion_id)
+            final_idx = idx[np.argmax(mapped.end_frames[idx])]
+            if int(mapped.end_frames[final_idx]) == int(motion_lengths_np[motion_id]) - 1:
+                mapped.end_frames[final_idx] = int(motion_lengths_np[motion_id])
+        if missing_policy == "error":
+            coverage_errors = []
+            for motion_id in range(num_motions):
+                idx = np.flatnonzero(mapped.motion_ids == motion_id)
+                order_local = np.argsort(mapped.start_frames[idx], kind="stable")
+                starts_local = mapped.start_frames[idx][order_local]
+                ends_local = mapped.end_frames[idx][order_local]
+                expected_end = max(int(motion_lengths_np[motion_id]), 1)
+                contiguous = (
+                    starts_local.size > 0
+                    and int(starts_local[0]) == 0
+                    and int(ends_local[-1]) == expected_end
+                    and np.array_equal(ends_local[:-1], starts_local[1:])
+                )
+                if not contiguous:
+                    coverage_errors.append(
+                        (motion_id, starts_local[:4].tolist(), ends_local[-4:].tolist(), expected_end)
+                    )
+            if coverage_errors:
+                raise ValueError(
+                    f"Capacity labels from {resolved_path} do not continuously cover "
+                    f"{len(coverage_errors)}/{num_motions} motions; first errors={coverage_errors[:5]}"
+                )
 
         order = np.lexsort((mapped.end_frames, mapped.start_frames, mapped.motion_ids))
         motion_ids = mapped.motion_ids[order].astype(np.int64, copy=False)

@@ -825,8 +825,8 @@ class window_cap_hand_load(Randomization):
             if single_side_local_ids.numel() > 0:
                 left_side = torch.rand(single_side_local_ids.shape, device=self.device) < 0.5
                 weights[single_side_local_ids] = 0.0
-                weights[single_side_local_ids, 0] = left_side.float() * 0.5
-                weights[single_side_local_ids, 1] = (~left_side).float() * 0.5
+                weights[single_side_local_ids, 0] = left_side.float()
+                weights[single_side_local_ids, 1] = (~left_side).float()
 
         self.body_load_weights[env_ids] = weights
 
