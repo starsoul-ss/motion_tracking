@@ -2,6 +2,18 @@
 
 task:
   profile:
+    command:
+      dataset:
+        groups:
+          - {name: lafan, teacher_mem_path: l7/lafan, weight: 0.2}
+          - {name: style100, teacher_mem_path: l7/100style, weight: 0.3}
+          - {name: seed, teacher_mem_path: l7/seed/all, weight: 0.35}
+          - name: vr_paired
+            teacher_mem_path: l7/vr_paired/clean
+            student_mem_path: l7/vr_paired/raw
+            weight: 0.15
+      student_motion_randomization:
+        enable: false
     randomization:
       perturb_body_wrench:
         enabled: false
@@ -27,7 +39,7 @@ task:
         inertial_accel_clip_mps2: 15.0
         force_application_offset_radius_range_m: [0.0, 0.05]
         hand_force_fraction_range: [0.2, 1.0]
-        window_no_load_ratio: 0.25
+        window_no_load_ratio: 0.0
         single_side_load_ratio: 0.25
         missing_motion_policy: error
   observation:

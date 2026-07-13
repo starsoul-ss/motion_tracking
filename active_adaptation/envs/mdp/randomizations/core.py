@@ -603,6 +603,7 @@ class window_cap_hand_load(Randomization):
         self,
         env,
         label_path: str = "",
+        constant_cap_kg: float | None = None,
         body_names: Tuple[str, str] = ("left_wrist_roll_link", "right_wrist_roll_link"),
         force_application_body_names: Tuple[str, str] | None = None,
         split_ratio_range: Tuple[float, float] = (0.35, 0.65),
@@ -629,8 +630,8 @@ class window_cap_hand_load(Randomization):
         if not self.enabled:
             self.body_ids = torch.empty(0, dtype=torch.long, device=self.device)
             return
-        if not label_path:
-            raise ValueError("window_cap_hand_load requires label_path when enabled=True.")
+        if not label_path and constant_cap_kg is None:
+            raise ValueError("window_cap_hand_load requires label_path or constant_cap_kg when enabled=True.")
 
         self.body_ids, self.body_names = self._resolve_ordered_body_ids(body_names)
         if force_application_body_names is None:
@@ -643,6 +644,7 @@ class window_cap_hand_load(Randomization):
         self.transition_duration_s = max(float(transition_duration_s), 1.0e-6)
         self.predrop_duration_s = max(float(predrop_duration_s), 1.0e-6)
         self.max_load_kg = max(float(max_load_kg), 0.0)
+        self.constant_cap_kg = None if constant_cap_kg is None else max(float(constant_cap_kg), 0.0)
         self.split_ratio_low = min(max(float(split_ratio_range[0]), 0.0), 1.0)
         self.split_ratio_high = min(max(float(split_ratio_range[1]), 0.0), 1.0)
         if self.split_ratio_high < self.split_ratio_low:
@@ -681,19 +683,25 @@ class window_cap_hand_load(Randomization):
         if command_manager is None or not hasattr(command_manager, "dataset"):
             raise RuntimeError("window_cap_hand_load requires MotionTrackingCommand with a dataset.")
         dataset = command_manager.dataset
-        self.lookup = WindowLoadCapacityLookup.from_label_file(
-            label_path,
-            motion_source_paths=dataset.motion_source_paths,
-            motion_labels=getattr(dataset, "motion_labels", None),
-            motion_lengths=dataset.global_lengths.detach().cpu(),
-            motion_fps=float(dataset.motion_fps),
-            device=self.device,
-            cap_safety_scale=float(cap_safety_scale),
-            missing_motion_policy=str(missing_motion_policy),
-        )
+        self.lookup = None
+        if label_path:
+            self.lookup = WindowLoadCapacityLookup.from_label_file(
+                label_path,
+                motion_source_paths=dataset.motion_source_paths,
+                motion_labels=getattr(dataset, "motion_labels", None),
+                motion_lengths=dataset.global_lengths.detach().cpu(),
+                motion_fps=float(dataset.motion_fps),
+                device=self.device,
+                cap_safety_scale=float(cap_safety_scale),
+                missing_motion_policy=str(missing_motion_policy),
+            )
 
         self.current_total_load_kg = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.target_total_load_kg = torch.zeros_like(self.current_total_load_kg)
+        self.controlled_load = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.controlled_current_load_kg = torch.zeros_like(self.current_total_load_kg)
+        self.controlled_target_load_kg = torch.zeros_like(self.current_total_load_kg)
+        self.controlled_ramp_sec = torch.ones_like(self.current_total_load_kg)
         self.transition_start_load_kg = torch.zeros_like(self.current_total_load_kg)
         self.transition_elapsed_s = torch.zeros_like(self.current_total_load_kg)
         self.transition_total_s = torch.full_like(self.current_total_load_kg, self.transition_duration_s)
@@ -723,15 +731,16 @@ class window_cap_hand_load(Randomization):
         self._sample_force_application_offsets(all_env_ids)
         self.step_schedule(0.0, None)
 
-        logging.info(
-            "window_cap_hand_load enabled: label=%s, matched_rows=%d, labeled_motions=%d/%d, bodies=%s, application_bodies=%s",
-            self.lookup.label_source,
-            self.lookup.matched_rows,
-            self.lookup.labeled_motions,
-            self.lookup.num_motions,
-            self.body_names,
-            self.force_application_body_names,
-        )
+        if self.lookup is not None:
+            logging.info(
+                "window_cap_hand_load enabled: label=%s, matched_rows=%d, labeled_motions=%d/%d, bodies=%s, application_bodies=%s",
+                self.lookup.label_source,
+                self.lookup.matched_rows,
+                self.lookup.labeled_motions,
+                self.lookup.num_motions,
+                self.body_names,
+                self.force_application_body_names,
+            )
 
     def _validate_nonnegative_range(self, name: str, values: Tuple[float, float]):
         if len(values) != 2:
@@ -783,7 +792,49 @@ class window_cap_hand_load(Randomization):
         if env_ids is not None:
             motion_ids = motion_ids[env_ids]
             frames = frames[env_ids]
+        if self.lookup is None:
+            lengths = self.env.command_manager.lengths.long()
+            if env_ids is not None:
+                lengths = lengths[env_ids]
+            valid = torch.ones_like(frames, dtype=torch.bool)
+            zeros = torch.zeros_like(frames)
+            return {
+                "valid": valid,
+                "flat_idx": motion_ids,
+                "bin_idx": zeros,
+                "start": zeros,
+                "end": lengths,
+                "cap_kg": torch.full_like(frames, self.constant_cap_kg, dtype=torch.float32),
+                "next_valid": torch.zeros_like(valid),
+                "next_start": zeros,
+                "next_cap_kg": torch.zeros_like(frames, dtype=torch.float32),
+            }
         return self.lookup.lookup(motion_ids, frames)
+
+    def set_controlled_load(
+        self,
+        env_ids: torch.Tensor,
+        current_load_kg: torch.Tensor,
+        target_load_kg: torch.Tensor,
+        ramp_sec: float,
+    ) -> None:
+        self.controlled_load[env_ids] = True
+        self.controlled_current_load_kg[env_ids] = current_load_kg
+        self.controlled_target_load_kg[env_ids] = target_load_kg
+        self.controlled_ramp_sec[env_ids] = ramp_sec
+        self._apply_controlled_load(env_ids)
+
+    def _apply_controlled_load(self, env_ids: torch.Tensor) -> None:
+        self.body_load_weights[env_ids] = 0.5
+        self.force_dirs_w[env_ids] = torch.tensor((0.0, 0.0, -1.0), device=self.device)
+        self.current_total_load_kg[env_ids] = self.controlled_current_load_kg[env_ids]
+        self.active_flat_bin_idx[env_ids] = self._lookup_current(env_ids)["flat_idx"]
+        self._start_transition(
+            env_ids,
+            self.controlled_target_load_kg[env_ids],
+            self.controlled_ramp_sec[env_ids],
+            self.MODE_RAMP,
+        )
 
     def step_schedule(self, progress: float, iters: int | None = None):
         if not self.enabled:
@@ -871,6 +922,9 @@ class window_cap_hand_load(Randomization):
             caps = self._effective_cap_kg(lookup["cap_kg"][valid])
             target = self._sample_window_target_loads(valid_ids, caps)
             self._start_transition(valid_ids, target, self.transition_duration_s, self.MODE_RAMP)
+        controlled_ids = env_ids[self.controlled_load[env_ids]]
+        if controlled_ids.numel() > 0:
+            self._apply_controlled_load(controlled_ids)
 
     def update(self):
         if not self.enabled:

@@ -62,6 +62,25 @@ def main(cfg: DictConfig):
     save_interval = cfg.get("save_interval", -1)
     start_iter = cfg.get("start_iter", 0)
     need_logging = aa.is_main_process() and cfg.wandb.get("mode", "disabled") != "disabled"
+    run = None
+
+    def save(checkpoint_name: str):
+        ckpt_path = os.path.join(os.getcwd(), f"{checkpoint_name}.pt")
+        state_dict = OrderedDict()
+        state_dict["wandb"] = {
+            "name": getattr(run, "name", None),
+            "id": getattr(run, "id", None),
+        }
+        state_dict["policy"] = policy.state_dict()
+        state_dict["env"] = env.state_dict()
+        state_dict["cfg"] = cfg
+        if vecnorm is not None:
+            state_dict["vecnorm"] = vecnorm.state_dict()
+        torch.save(state_dict, ckpt_path)
+        if run is not None:
+            run.save(ckpt_path, policy="now", base_path=os.getcwd())
+        logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+
     if need_logging:
         default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         run = init_wandb_run(cfg.wandb, config=cfg, name=default_run_name)
@@ -92,24 +111,7 @@ def main(cfg: DictConfig):
         ]
         episode_stats = EpisodeStats(stats_keys, device=env.device)
 
-        def save(policy, checkpoint_name: str):
-            ckpt_path = os.path.join(run.dir, f"{checkpoint_name}.pt")
-            state_dict = OrderedDict()
-            state_dict["wandb"] = {"name": run.name, "id": run.id}
-            state_dict["policy"] = policy.state_dict()
-            state_dict["env"] = env.state_dict()
-            state_dict["cfg"] = cfg
-            if "vecnorm" in locals():
-                state_dict["vecnorm"] = vecnorm.state_dict()
-            torch.save(state_dict, ckpt_path)
-            run.save(ckpt_path, policy="now", base_path=run.dir)
-            logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
-        def should_save(i):
-            if not aa.is_main_process():
-                return False
-            return i > 0 and i % save_interval == 0
-    
     rollout_policy = policy.get_rollout_policy("train")
     env_frames = 0
     carry = env.reset()
@@ -216,19 +218,19 @@ def main(cfg: DictConfig):
             info["rollout_fps"] = data.numel() / rollout_time * aa.get_world_size()
             info["training_time"] = training_time
         
-            if save_interval and save_interval > 0 and should_save(i):
-                save(policy, f"checkpoint_{i}")
-
             run.log(info, step=i)
             print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, (float, int))}))
+
+        if aa.is_main_process() and save_interval > 0 and i > 0 and i % save_interval == 0:
+            save(f"checkpoint_{i}")
     
     if aa.is_main_process():
         if train_recorder is not None:
             train_recorder.flush()
 
-        if need_logging:
-            save(policy, "checkpoint_final")
+        save("checkpoint_final")
 
+        if need_logging:
             policy_eval = policy.get_rollout_policy("eval")
             info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
             run.log(info, step=total_iters)

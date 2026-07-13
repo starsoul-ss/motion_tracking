@@ -1,6 +1,6 @@
 tracking_name: L7TRACKING
 name: xbot_l7
-mass: 64.555507
+mass: 65.63364101
 
 body:
   base_pattern: pelvis

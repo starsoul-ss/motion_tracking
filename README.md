@@ -159,8 +159,8 @@ If paired PMG data is unavailable:
 1. Leave the paired group commented out.
 2. Keep `student_motion_randomization.enable: true`.
 
-L7 WPC support is configured through `cfg/load/l7_wpc.yaml`, but the public WPC payload
-labels and datasets are planned for a later release.
+L7 WPC support is configured through `cfg/load/l7_wpc.yaml`, but the datasets and
+window-cap labels are external artifacts.
 
 ## Training
 
@@ -199,6 +199,25 @@ With 8*8192 envs, training takes roughly 6 hours on 8 PRO6000 GPUs. If GPU memor
 is constrained, reduce `NPROC` in `train.sh` and `num_envs` in
 `cfg/task/common/base.yaml`. Reducing the total number of environments or the training
 budget may significantly affect final performance.
+
+## L7 Expert And WPC Pipeline
+
+Generate filtered datasets and matching window-cap labels without changing the original
+datasets:
+
+```bash
+bash scripts/run_l7_expert_label_pipeline.sh
+```
+
+The finalizer removes complete infeasible motions and reuses the retained successful
+rollout rows; a second rollout is unnecessary because retained frame data and metadata
+do not change. Train WPC with the matching filtered dataset and label file:
+
+```bash
+MEMPATH=/path/to/dataset_filtered \
+L7_WINDOW_LOAD_CAP_LABEL_PATH=/path/to/window_caps_5s.npz \
+bash scripts/run_l7_training_pipeline.sh
+```
 
 ## Evaluation And Export
 
