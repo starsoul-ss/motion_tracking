@@ -1,0 +1,120 @@
+# @package _global_
+
+wandb:
+  entity: liu-cx-tsinghua-university
+  project: l7_mjlab
+
+task:
+  student_train: false
+  profile:
+    action:
+      max_delay: 0
+      torque_limit_scale_range: [1.0, 1.0]
+      torque_limit_progress_range: [0.0, 1.0]
+      boot_delay_steps: 0
+    command:
+      reinit_prob: 0.0
+      dataset:
+        groups:
+          - name: lafan
+            teacher_mem_path: l7/lafan
+            weight: 0.2
+          - name: style100
+            teacher_mem_path: l7/100style
+            weight: 0.3
+          - name: seed
+            teacher_mem_path: l7/seed/all
+            weight: 0.35
+          - name: vr_clean
+            teacher_mem_path: l7/vr_paired/clean
+            weight: 0.15
+      student_motion_randomization:
+        enable: false
+      shared_joint_pos:
+        std: {".*": 0.0}
+        bias: {".*": 0.0}
+      shared_joint_vel:
+        std: {".*": 0.0}
+    observation:
+      policy:
+        noise:
+          command_obs: 0.0
+          root_angvel_history: 0.0
+          projected_gravity_history: 0.0
+          projected_gravity_history_bias: 0.0
+          joint_pos_history: 0.0
+          joint_vel_history: 0.0
+    randomization:
+      motor_params_implicit:
+        mode: uniform
+        stiffness_range:
+          ".*(shoulder|arm_yaw|elbow|wrist).*": [1.0, 1.0]
+          ".*(waist_yaw|hip|knee).*": [1.0, 1.0]
+          ".*(waist_roll|waist_pitch|ankle).*": [1.0, 1.0]
+        damping_range:
+          ".*(shoulder|arm_yaw|elbow|wrist).*": [1.0, 1.0]
+          ".*(waist_yaw|hip|knee).*": [1.0, 1.0]
+          ".*(waist_roll|waist_pitch|ankle).*": [1.0, 1.0]
+        armature_range:
+          ".*(shoulder|arm_yaw|elbow|wrist).*": [1.0, 1.0]
+          ".*(waist_yaw|hip|knee).*": [1.0, 1.0]
+          ".*(waist_roll|waist_pitch|ankle).*": [1.0, 1.0]
+        frictionloss_range:
+          ".*(shoulder|elbow_pitch|elbow_yaw|wrist|waist).*": [0.0, 0.0]
+          ".*(arm_yaw).*": [0.0, 0.0]
+      random_joint_offset:
+        ".*": [0.0, 0.0]
+      perturb_root_vel:
+        min_s: 4.0
+        max_s: 6.0
+        x: [0.0, 0.0]
+        y: [0.0, 0.0]
+        z: [0.0, 0.0]
+        roll: [0.0, 0.0]
+        pitch: [0.0, 0.0]
+        yaw: [0.0, 0.0]
+      perturb_body_wrench:
+        enabled: false
+      perturb_body_materials:
+        static_friction_range: [1.0, 1.0]
+        solref_time_constant_range: [0.02, 0.02]
+        solref_dampratio_range: [1.0, 1.0]
+      window_cap_hand_load:
+        enabled: true
+        label_path: ""
+        constant_cap_kg: 30.0
+        body_names: [left_wrist_roll_link, right_wrist_roll_link]
+        force_application_body_names: [left_hand_mimic, right_hand_mimic]
+        split_ratio_range: [0.35, 0.65]
+        single_side_load_ratio: 0.25
+        window_no_load_ratio: 0.0
+        force_cone_half_angle_deg: 12.0
+        transition_duration_s: 1.0
+        max_load_kg: 30.0
+        cap_curriculum_progress_range: [0.0, 0.8]
+        cap_curriculum_scale_range: [0.0, 1.0]
+        inertial_force_scale_range: [0.8, 1.2]
+        inertial_accel_tau_s: 0.08
+        inertial_accel_clip_mps2: 15.0
+        force_application_offset_radius_range_m: [0.0, 0.05]
+        hand_force_fraction_range: [0.2, 1.0]
+  action:
+    alpha: [1.0, 1.0]
+    boot_protect: false
+  command:
+    init_noise:
+      root_pos: 0.0
+      root_ori: 0.0
+      root_lin_vel: 0.0
+      root_ang_vel: 0.0
+      joint_pos: 0.0
+      joint_vel: 0.0
+  observation:
+    priv:
+      domain_window_cap_hand_load: {}
+  randomization:
+    perturb_body_com:
+      com_range: [0.0, 0.0]
+    perturb_gravity:
+      mean: [0.0, 0.0, -9.81]
+      std: 0.0

@@ -185,7 +185,9 @@
                         <body name="left_wrist_roll_link">
                           <inertial pos="0.0157279998 0 -0.0300050003" quat="0.896228604 0 -0.443592481 -0" mass="0.091311001" diaginertia="2.83558037e-05 8.90000108e-05 9.26442171e-05" />
                           <joint name="left_wrist_roll_joint" pos="0 0 0" axis="1 0 0" range="-1.57 1.57" actuatorfrcrange="-35 35" />
-                          <body name="left_hand_mimic" pos="0 0 -0.11" />
+                          <body name="left_hand_mimic" pos="0 0 -0.11">
+                            <inertial pos="-0.007654 -0.007065 0.001229" mass="0.53910397" diaginertia="0.00064437 0.00046461 0.00027759" />
+                          </body>
                           <geom class="visual" mesh="left_wrist_roll_link" />
                           <geom class="visual" mesh="left_hand_flange_link" pos="0 0 -0.051" quat="2.67949e-08 1 0 0" />
                           <geom name="left_wrist_roll_collision" class="collision" type="sphere" size="0.027" pos="0.006 0 -0.055" />
@@ -229,7 +231,9 @@
                         <body name="right_wrist_roll_link">
                           <inertial pos="0.0157279998 0 -0.0300050003" quat="0.896228604 0 -0.443592481 -0" mass="0.091311001" diaginertia="2.83558037e-05 8.90000108e-05 9.26442171e-05" />
                           <joint name="right_wrist_roll_joint" pos="0 0 0" axis="1 0 0" range="-1.57 1.57" actuatorfrcrange="-35 35" />
-                          <body name="right_hand_mimic" pos="0 0 -0.11" />
+                          <body name="right_hand_mimic" pos="0 0 -0.11">
+                            <inertial pos="-0.006625 0.007006 -0.000294" mass="0.53903004" diaginertia="0.00064214 0.00046462 0.00027541" />
+                          </body>
                           <geom class="visual" mesh="right_wrist_roll_link" />
                           <geom class="visual" mesh="right_hand_flange_link" pos="0 0 -0.051" quat="2.67949e-08 1 0 0" />
                           <geom name="right_wrist_roll_collision" class="collision" type="sphere" size="0.027" pos="0.006 0 -0.055" />

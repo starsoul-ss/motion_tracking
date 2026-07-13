@@ -159,33 +159,53 @@ If paired PMG data is unavailable:
 1. Leave the paired group commented out.
 2. Keep `student_motion_randomization.enable: true`.
 
-L7 WPC support is configured through `cfg/load/l7_wpc.yaml`, but the public WPC payload
-labels and datasets are planned for a later release.
+L7 WPC support is configured through `cfg/load/l7_wpc.yaml`. The training datasets and
+window-cap labels are external artifacts and are planned for a later release.
+
+## L7 Expert And WPC Labels
+
+Train the clean-reference expert as a single-stage policy:
+
+```bash
+LOAD_CONFIG=l7_expert TAG=l7_expert bash train.sh
+```
+
+Or run expert training, eight-GPU rollout, infeasible-motion filtering, and label
+construction end to end:
+
+```bash
+bash scripts/run_l7_expert_label_pipeline.sh
+```
+
+This defaults to 8 GPUs with 12,288 environments per training process. Only training
+uses W&B, and checkpoints remain local. The original datasets are preserved; filtered
+copies and the final NPZ are written under `outputs/expert_label_pipeline/<run>/`.
+
+Generate 5 s window caps from that expert using the paper protocol grid (30 kg down to
+0 kg in 5 kg steps):
+
+```bash
+CFG_PATH=/path/to/expert/cfg.yaml \
+CHECKPOINT_PATH=/path/to/expert/checkpoint_final.pt \
+OUTPUT_DIR=outputs/window_caps \
+bash scripts/run_l7_window_caps_8gpu.sh
+```
+
+Rows whose status is not `success` must not enter a training label.
+`scripts/finalize_l7_window_caps.py` removes every motion containing such a row, applies
+the same removal manifest to paired VR clean/raw datasets, and builds labels only from
+the retained motions' existing successful rollout rows. A second rollout is unnecessary:
+filtering removes complete motions while preserving the retained motions' frame data and
+metadata.
 
 ## Training
 
-Use `train.sh` as the main entry point. Edit the global configuration at the top of the
-file, especially:
-
-- `PROJECT`
-- `NPROC`
-- the final `run_pipeline` line
-
-For G1:
+Use `train.sh` as the main entry point. L7 WPC requires the filtered dataset and its
+matching final label file:
 
 ```bash
-run_pipeline "G1_tracking" "g1_track" "release"
-```
-
-For L7:
-
-```bash
-run_pipeline "L7_tracking" "l7_track" "release"
-```
-
-Then run:
-
-```bash
+export MEMPATH=/absolute/path/to/dataset_filtered
+export L7_WINDOW_LOAD_CAP_LABEL_PATH=/absolute/path/to/window_caps_5s.npz
 bash train.sh
 ```
 
@@ -195,10 +215,10 @@ bash train.sh
 2. `+exp=adapt`, initialized from the train run
 3. `+exp=finetune`, initialized from the adapt run
 
-With 8*8192 envs, training takes roughly 6 hours on 8 PRO6000 GPUs. If GPU memory
-is constrained, reduce `NPROC` in `train.sh` and `num_envs` in
-`cfg/task/common/base.yaml`. Reducing the total number of environments or the training
-budget may significantly affect final performance.
+Override `PROFILE`, `LOAD_CONFIG`, `NPROC`, `TAG`, `OUTPUT_ROOT`, or `WANDB_MODE` as
+environment variables. Expert training defaults to the `train` stage only; WPC training
+defaults to all three stages. If GPU memory is constrained, reduce `NPROC` and
+`task.num_envs`. Reducing the total environments or budget may affect performance.
 
 ## Evaluation And Export
 

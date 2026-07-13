@@ -218,8 +218,11 @@ class PPOPolicy(TensorDictModuleBase):
         # init weights (orthogonal for MLPS/linear)
         def ortho_(m):
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
-                nn.init.zeros_(m.bias)
+                weight = torch.empty_like(m.weight, device="cpu")
+                nn.init.orthogonal_(weight, gain=0.01)
+                with torch.no_grad():
+                    m.weight.copy_(weight.to(device=m.weight.device, dtype=m.weight.dtype))
+                    nn.init.zeros_(m.bias)
 
         self.apply(ortho_)
 

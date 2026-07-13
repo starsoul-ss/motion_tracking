@@ -88,7 +88,27 @@ def _get_muon_optimizer():
         raise ImportError(
             "optimizer='muon' requires torch.optim.Muon, but this PyTorch build does not provide it."
         )
+    import torch.optim._muon as torch_muon
+
+    torch_muon._zeropower_via_newtonschulz = _muon_newtonschulz_float32
     return muon
+
+
+def _muon_newtonschulz_float32(grad, ns_coefficients, ns_steps, eps):
+    a, b, c = ns_coefficients
+    update = grad.float()
+    transposed = grad.size(0) > grad.size(1)
+    if transposed:
+        update = update.T
+    update.div_(update.norm().clamp(min=eps))
+    for _ in range(ns_steps):
+        gram = update @ update.T
+        gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+        update = torch.addmm(update, gram_update, update, beta=a)
+    if transposed:
+        update = update.T
+    return update
+
 
 def build_optimizer(
     params,

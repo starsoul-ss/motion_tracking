@@ -31,11 +31,13 @@ train_record:
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: heft # change this to your own project if you want to log to wandb
+  entity: liu-cx-tsinghua-university
+  project: l7_mjlab
   mode: online # set to 'disabled' when debugging locally
   tags: []
   id: null
   notes: null
+  upload_checkpoints: false
   settings:
     http_proxy: null
     https_proxy: null

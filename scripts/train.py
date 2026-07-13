@@ -1,6 +1,7 @@
 import torch
 # import warp
 import hydra
+from hydra.core.hydra_config import HydraConfig
 import numpy as np
 
 import einops
@@ -62,6 +63,29 @@ def main(cfg: DictConfig):
     save_interval = cfg.get("save_interval", -1)
     start_iter = cfg.get("start_iter", 0)
     need_logging = aa.is_main_process() and cfg.wandb.get("mode", "disabled") != "disabled"
+    upload_checkpoints = bool(cfg.wandb.get("upload_checkpoints", False))
+    run = None
+
+    def save(policy, checkpoint_name: str):
+        ckpt_path = os.path.join(HydraConfig.get().runtime.output_dir, f"{checkpoint_name}.pt")
+        state_dict = OrderedDict()
+        state_dict["wandb"] = {
+            "name": getattr(run, "name", None),
+            "id": getattr(run, "id", None),
+        }
+        state_dict["policy"] = policy.state_dict()
+        state_dict["env"] = env.state_dict()
+        state_dict["cfg"] = cfg
+        if "vecnorm" in locals():
+            state_dict["vecnorm"] = vecnorm.state_dict()
+        torch.save(state_dict, ckpt_path)
+        if run is not None and upload_checkpoints:
+            run.save(ckpt_path, policy="now", base_path=HydraConfig.get().runtime.output_dir)
+        logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+
+    def should_save(i):
+        return aa.is_main_process() and i > 0 and i % save_interval == 0
+
     if need_logging:
         default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         run = init_wandb_run(cfg.wandb, config=cfg, name=default_run_name)
@@ -74,14 +98,6 @@ def main(cfg: DictConfig):
         cfg_save_path = os.path.join(run.dir, "cfg.yaml")
         OmegaConf.save(cfg, cfg_save_path)
         run.save(cfg_save_path, policy="now")
-        run.save(os.path.join(run.dir, "config.yaml"), policy="now")
-
-        import inspect
-        import shutil
-        source_path = inspect.getfile(policy.__class__)
-        target_path = os.path.join(run.dir, source_path.split("/")[-1])
-        shutil.copy(source_path, target_path)
-        run.save(target_path, policy="now")
 
         log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
         logging.info(f"Log interval: {log_interval} steps")
@@ -92,24 +108,7 @@ def main(cfg: DictConfig):
         ]
         episode_stats = EpisodeStats(stats_keys, device=env.device)
 
-        def save(policy, checkpoint_name: str):
-            ckpt_path = os.path.join(run.dir, f"{checkpoint_name}.pt")
-            state_dict = OrderedDict()
-            state_dict["wandb"] = {"name": run.name, "id": run.id}
-            state_dict["policy"] = policy.state_dict()
-            state_dict["env"] = env.state_dict()
-            state_dict["cfg"] = cfg
-            if "vecnorm" in locals():
-                state_dict["vecnorm"] = vecnorm.state_dict()
-            torch.save(state_dict, ckpt_path)
-            run.save(ckpt_path, policy="now", base_path=run.dir)
-            logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
-        def should_save(i):
-            if not aa.is_main_process():
-                return False
-            return i > 0 and i % save_interval == 0
-    
     rollout_policy = policy.get_rollout_policy("train")
     env_frames = 0
     carry = env.reset()
@@ -216,19 +215,19 @@ def main(cfg: DictConfig):
             info["rollout_fps"] = data.numel() / rollout_time * aa.get_world_size()
             info["training_time"] = training_time
         
-            if save_interval and save_interval > 0 and should_save(i):
-                save(policy, f"checkpoint_{i}")
-
             run.log(info, step=i)
             print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, (float, int))}))
+
+        if save_interval and save_interval > 0 and should_save(i):
+            save(policy, f"checkpoint_{i}")
     
     if aa.is_main_process():
         if train_recorder is not None:
             train_recorder.flush()
 
-        if need_logging:
-            save(policy, "checkpoint_final")
+        save(policy, "checkpoint_final")
 
+        if need_logging:
             policy_eval = policy.get_rollout_policy("eval")
             info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
             run.log(info, step=total_iters)

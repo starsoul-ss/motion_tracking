@@ -1,6 +1,6 @@
 tracking_name: L7TRACKING
 name: xbot_l7
-mass: 64.555507
+mass: 65.63364101
 
 body:
   base_pattern: pelvis
@@ -42,19 +42,19 @@ command:
     groups:
       - name: lafan
         teacher_mem_path: l7/lafan
-        weight: 0.3
+        weight: 0.2
       - name: style100
         teacher_mem_path: l7/100style
         weight: 0.3
       - name: seed
         teacher_mem_path: l7/seed/all
-        weight: 0.3
+        weight: 0.35
       ## PMG paired dataset. If PMG is enabled, keep student_motion_randomization disabled.
       ## If PMG data is unavailable, comment this group out and enable student_motion_randomization instead.
-      # - name: vr_paired
-      #   teacher_mem_path: l7/vr_paired/clean
-      #   student_mem_path: l7/vr_paired/raw
-      #   weight: 0.1
+      - name: vr_paired
+        teacher_mem_path: l7/vr_paired/clean
+        student_mem_path: l7/vr_paired/raw
+        weight: 0.15
     offset_pos_z: 0.0
     cache_request_range: [-20, 24]
     cache_fill_range: [-20, 100]
@@ -62,7 +62,7 @@ command:
   reinit_prob: 0.5
   student_motion_randomization:
     # Enable this motion DR only when PMG paired data is not used.
-    enable: true
+    enable: false
     root_pos_noise_std: 0.005
     root_ori_noise_std: 0.02
     joint_pos_noise_std: 0.01

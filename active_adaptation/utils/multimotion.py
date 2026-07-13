@@ -259,6 +259,15 @@ class ProgressiveMultiMotionDataset:
         # self._invalidate_cache(env_ids)
         return self._len_A[env_ids]
 
+    def set_motion_ids(self, env_ids: torch.Tensor, motion_ids: torch.Tensor) -> torch.Tensor:
+        env_ids = env_ids.long()
+        motion_ids = motion_ids.to(device=self.device, dtype=torch.long)
+        self._motion_ids_A[env_ids] = motion_ids
+        self._dataset_ids_A[env_ids] = self.motion_to_dataset_id[motion_ids]
+        self._len_A[env_ids] = self.global_lengths[motion_ids].to(dtype=torch.int32)
+        self._invalidate_cache(env_ids)
+        return self._len_A[env_ids]
+
     @property
     def env_dataset_ids(self) -> torch.Tensor:
         return self._dataset_ids_A

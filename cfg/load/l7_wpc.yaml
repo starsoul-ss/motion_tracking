@@ -27,7 +27,7 @@ task:
         inertial_accel_clip_mps2: 15.0
         force_application_offset_radius_range_m: [0.0, 0.05]
         hand_force_fraction_range: [0.2, 1.0]
-        window_no_load_ratio: 0.25
+        window_no_load_ratio: 0.0
         single_side_load_ratio: 0.25
         missing_motion_policy: error
   observation:
